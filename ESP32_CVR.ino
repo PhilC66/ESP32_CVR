@@ -3,11 +3,11 @@
   (basé sur ESP32_Signalisation
 
   Compilation LOLIN D32,default,80MHz, ESP32 1.0.2 (1.0.4 bugg?)
-  Arduino IDE 1.8.10 : 999834 76%, 47760 14% sur PC
-  Arduino IDE 1.8.10 :  77%,  14% sur raspi
+  Arduino IDE 1.8.10 : 999866 76%, 47760 14% sur PC
+  Arduino IDE 1.8.10 : 999846 76%, 47760 14% sur raspi
 
-  V1-0
-
+  V1-0 installé 26/11/2020
+  
   Etat CVR
              | Cvr | Cde
   Fermé      |  1  |  F
@@ -80,8 +80,8 @@ char filecalibration[11] = "/coeff.txt";    // fichier en SPIFFS contenant les d
 char filelog[9]          = "/log.txt";      // fichier en SPIFFS contenant le logé
 
 const String soft = "ESP32_CVR.ino.d32"; // nom du soft
-String ver        = "V00";
-int    Magique    = 1;
+String ver        = "V1-0";
+int    Magique    = 2;
 const String Mois[13] = {"", "Janvier", "Fevrier", "Mars", "Avril", "Mai", "Juin", "Juillet", "Aout", "Septembre", "Octobre", "Novembre", "Decembre"};
 String Sbidon 		= ""; // String texte temporaire
 String message;
@@ -240,7 +240,7 @@ void setup() {
     // config.Pos_Pn_PB[1]  = 1;	// le premier numero du PB par defaut
     String temp          = "TPCF_CVR1";
     temp.toCharArray(config.Idchar, 11);
-    String tempapn       = "sl2sfr";//"free";//"sl2sfr"
+    String tempapn       = "free";//"sl2sfr"
     String tempGprsUser  = "";
     String tempGprsPass  = "";
     config.ftpPort       = tempftpPort;
@@ -2023,9 +2023,12 @@ void OuvrirCalendrier() {
 void FinJournee() {
   // fin de journée retour deep sleep
   // si CVR fermé, demande ouverture avant fin de journée
-  if (Cvr == 1) {
+  static bool first = true; // autorise une seule tentative ouverture
+  if (Cvr == 1 && first) {
+    first = false;
     FlagFinJournee = true;
     MajLog("Auto", "Ouverture Auto");
+    Memo_Demande_CVR[2]="OXXXX";
     Ouvrir_CVR();
     return;
   }
