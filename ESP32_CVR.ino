@@ -3,8 +3,15 @@
   (basé sur ESP32_Signalisation
 
   Compilation LOLIN D32,default,80MHz, ESP32 1.0.2 (1.0.4 bugg?)
-  Arduino IDE 1.8.10 : 999866 76%, 47760 14% sur PC
+  Arduino IDE 1.8.10 : 999990 76%, 47800 14% sur PC
   Arduino IDE 1.8.10 : 999846 76%, 47760 14% sur raspi
+
+  V1-1 12/12/2020 pas installé
+  remplacer <credentials_ftp.h> par <credentials_tpcf.h>
+  char ftpUser
+  nouveau magic
+  Allumage Frouge seulement apres verification position F
+  Ajouter info Defaut Commande dans message KO
 
   V1-0 installé 26/11/2020
   
@@ -42,7 +49,7 @@
 #include <Ticker.h>
 #include "passdata.h"
 #include <ArduinoJson.h>
-#include <credentials_ftp.h>
+#include <credentials_tpcf.h>
 
 String  webpage = "";
 #define ServerVersion "1.0"
@@ -80,8 +87,8 @@ char filecalibration[11] = "/coeff.txt";    // fichier en SPIFFS contenant les d
 char filelog[9]          = "/log.txt";      // fichier en SPIFFS contenant le logé
 
 const String soft = "ESP32_CVR.ino.d32"; // nom du soft
-String ver        = "V1-0";
-int    Magique    = 2;
+String ver        = "V1-1";
+int    Magique    = 3;
 const String Mois[13] = {"", "Janvier", "Fevrier", "Mars", "Avril", "Mai", "Juin", "Juillet", "Aout", "Septembre", "Octobre", "Novembre", "Decembre"};
 String Sbidon 		= ""; // String texte temporaire
 String message;
@@ -151,7 +158,7 @@ struct  config_t           // Structure configuration sauvée en EEPROM
   char    gprsUser[11];    // user for APN
   char    gprsPass[11];    // pass for APN
   char    ftpServeur[26];  // serveur ftp
-  char    ftpUser[8];      // user ftp
+  char    ftpUser[9];      // user ftp
   char    ftpPass[16];     // pwd ftp
   int     ftpPort;         // port ftp
 } ;
@@ -247,7 +254,7 @@ void setup() {
     tempapn.toCharArray(config.apn, (tempapn.length() + 1));
     tempGprsUser.toCharArray(config.gprsUser, (tempGprsUser.length() + 1));
     tempGprsPass.toCharArray(config.gprsPass, (tempGprsPass.length() + 1));
-    tempftpServer.toCharArray(config.ftpServeur, (tempftpServer.length() + 1));
+    tempServer.toCharArray(config.ftpServeur, (tempServer.length() + 1));
     tempftpUser.toCharArray(config.ftpUser, (tempftpUser.length() + 1));
     tempftpPass.toCharArray(config.ftpPass, (tempftpPass.length() + 1));
 
@@ -430,6 +437,7 @@ void Acquisition() {
       if (nalaPosition > 0) nalaPosition --; // efface progressivement le compteur
     }
     if (Cvr == 1 && !Allume) {
+      ledcWrite(RgePwmChanel, 0);
       SlowBlink.attach_ms(config.SlowBlinker, blink);// Allumage Feux Rouge
       Allume = true;
     }
@@ -1620,6 +1628,10 @@ void generationMessage(bool n) {
     message += "Jour Non Circule";
   }
   message += fl;
+  if(FlagAlarmePosition){
+    message += "Defaut Commande";
+    message += fl;
+  }
 }
 //---------------------------------------------------------------------------
 void EnvoyerSms(char *num, bool sms) {
@@ -3151,9 +3163,9 @@ void fermeture() {
   digitalWrite(PinFerme, LOW);// cde relais Verin
   Alarm.disable(Afermeture);
   FlagVerif_CVR = true;// flag pour verification position
-  ledcWrite(RgePwmChanel, 0);
-  SlowBlink.attach_ms(config.SlowBlinker, blink);// Allumage Feux Rouge
-  Allume = true;
+  // ledcWrite(RgePwmChanel, 0);
+  // SlowBlink.attach_ms(config.SlowBlinker, blink);// Allumage Feux Rouge
+  // Allume = true;
   Acquisition();
 }
 //---------------------------------------------------------------------------
