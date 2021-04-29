@@ -3,15 +3,15 @@
   (basé sur ESP32_Signalisation
 
   Compilation LOLIN D32,default,80MHz, ESP32 1.0.2 (1.0.4 bugg?)
-  Arduino IDE 1.8.10 : 999990 76%, 47800 14% sur PC
-  Arduino IDE 1.8.10 : 999846 76%, 47760 14% sur raspi
+  Arduino IDE 1.8.10 : 1000014 76%, 47800 14% sur PC
+  Arduino IDE 1.8.10 :  999994 76%, 47800 14% sur raspi
 
-  V1-1 12/12/2020 pas installé
+  V1-1 12/12/2020 installé le 29/04/2021
   remplacer <credentials_ftp.h> par <credentials_tpcf.h>
   char ftpUser
   nouveau magic
   Allumage Frouge seulement apres verification position F
-  Ajouter info Defaut Commande dans message KO
+  Ajouter info Defaut Position dans message KO
 
   V1-0 installé 26/11/2020
   
@@ -1629,7 +1629,7 @@ void generationMessage(bool n) {
   }
   message += fl;
   if(FlagAlarmePosition){
-    message += "Defaut Commande";
+    message += "Defaut Position";
     message += fl;
   }
 }
