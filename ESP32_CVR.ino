@@ -6,6 +6,11 @@
   Arduino IDE 1.8.10 : 1000014 76%, 47800 14% sur PC
   Arduino IDE 1.8.10 :  999994 76%, 47800 14% sur raspi
 
+  V1-2 10/06/2021 pas encore installé
+  nouveau magique
+  valeur par defaut tempoouverture et tempofermeture = 20(appliqué 09/06/2021)
+  valeur par maxi tempoouverture et tempofermeture = 120
+
   V1-1 12/12/2020 installé le 29/04/2021
   remplacer <credentials_ftp.h> par <credentials_tpcf.h>
   char ftpUser
@@ -87,8 +92,8 @@ char filecalibration[11] = "/coeff.txt";    // fichier en SPIFFS contenant les d
 char filelog[9]          = "/log.txt";      // fichier en SPIFFS contenant le logé
 
 const String soft = "ESP32_CVR.ino.d32"; // nom du soft
-String ver        = "V1-1";
-int    Magique    = 3;
+String ver        = "V1-2";
+int    Magique    = 4;
 const String Mois[13] = {"", "Janvier", "Fevrier", "Mars", "Avril", "Mai", "Juin", "Juillet", "Aout", "Septembre", "Octobre", "Novembre", "Decembre"};
 String Sbidon 		= ""; // String texte temporaire
 String message;
@@ -239,8 +244,8 @@ void setup() {
     config.timeoutWifi   = 15 * 60;
     config.SlowBlinker   = 500;
     config.FRgePWM       = 100;
-    config.Tempofermeture = 12;
-    config.Tempoouverture = 12;
+    config.Tempofermeture = 20;
+    config.Tempoouverture = 20;
     for (int i = 0; i < 10; i++) {// initialise liste PhoneBook liste restreinte
       config.Pos_Pn_PB[i] = 0;
     }
@@ -1201,7 +1206,7 @@ fin_i:
       else if (textesms.indexOf("TEMPOOUVERTURE") >= 0) {
         if (textesms.indexOf(char(61)) == 14) {
           int n = textesms.substring(15, textesms.length()).toInt();
-          if (n > 4 && n < 31) {
+          if (n > 4 && n < 121) {
             config.Tempoouverture = n;
             sauvConfig();														// sauvegarde en EEPROM
           }
@@ -1214,7 +1219,7 @@ fin_i:
       else if (textesms.indexOf("TEMPOFERMETURE") >= 0) {
         if (textesms.indexOf(char(61)) == 14) {
           int n = textesms.substring(15, textesms.length()).toInt();
-          if (n > 4 && n < 31) {
+          if (n > 4 && n < 121) {
             config.Tempofermeture = n;
             sauvConfig();														// sauvegarde en EEPROM
           }
@@ -2614,12 +2619,12 @@ void HomePage() {
   webpage += "</tr>";
 
   webpage += "<tr>";
-  webpage += "<td>Tempo Ouverture (5-30s)</td>";
+  webpage += "<td>Tempo Ouverture (5-120s)</td>";
   webpage += "<td>";	webpage += String(config.Tempoouverture);	webpage += "</td>";
   webpage += "</tr>";
 
   webpage += "<tr>";
-  webpage += "<td>Tempo Fermeture (5-30s)</td>";
+  webpage += "<td>Tempo Fermeture (5-120s)</td>";
   webpage += "<td>";	webpage += String(config.Tempofermeture);	webpage += "</td>";
   webpage += "</tr>";
 
