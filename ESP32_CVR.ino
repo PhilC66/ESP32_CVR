@@ -2,6 +2,9 @@
   Gestion Carré VR
   (basé sur ESP32_Signalisation
 
+  todo
+  Ajouter commande Allumage/extinction Feu Rouge independante
+  
   Compilation LOLIN D32,default,80MHz, ESP32 1.0.2 (1.0.4 bugg?)
   Arduino IDE 1.8.10 : 1000014 76%, 47800 14% sur PC
   Arduino IDE 1.8.10 :  999994 76%, 47800 14% sur raspi
