@@ -5,6 +5,20 @@
   todo
   Ajouter commande Allumage/extinction Feu Rouge independante
   
+  V1-3 22/03/2024 installé CVR1
+  1- Récupération des message long de free avec numero appelant de 29c et message de 268c
+    SIM800l modifié 1.1.31
+  2- Batterie LiFePo
+  3- mesure batterie pendant calibration
+  4- SENDAT
+  5- VIDELOG
+  6- correction envoieGroupeSMS
+  
+  Compilation LOLIN D32,default,80MHz, IMPORTANT ESP32 1.0.2 (version > bug avec SPIFFS?)
+  Arduino IDE 1.8.19 : 1003278 76%, 47760 14% sur PC IDE Arduino et VSCODE
+  Arduino IDE 1.8.19 : x 77%, x 14% sur raspi (sans ULP)
+
+
   Compilation LOLIN D32,default,80MHz, ESP32 1.0.2 (1.0.4 bugg?)
   Arduino IDE 1.8.10 : 1000014 76%, 47800 14% sur PC
   Arduino IDE 1.8.10 :  999994 76%, 47800 14% sur raspi
@@ -95,7 +109,7 @@ char filecalibration[11] = "/coeff.txt";    // fichier en SPIFFS contenant les d
 char filelog[9]          = "/log.txt";      // fichier en SPIFFS contenant le logé
 
 const String soft = "ESP32_CVR.ino.d32"; // nom du soft
-String ver        = "V1-2";
+String ver        = "V1-3";
 int    Magique    = 4;
 const String Mois[13] = {"", "Janvier", "Fevrier", "Mars", "Avril", "Mai", "Juin", "Juillet", "Aout", "Septembre", "Octobre", "Novembre", "Decembre"};
 String Sbidon 		= ""; // String texte temporaire
@@ -104,7 +118,7 @@ String bufferrcpt;
 String fl = "\n";                   //  saut de ligne SMS
 String Id ;                         //  Id du materiel sera lu dans EEPROM
 char   SIM800InBuffer[64];          //  for notifications from the SIM800
-char   replybuffer[255];            //  Buffer de reponse SIM800
+char   replybuffer[270];            //  Buffer de reponse SIM800, historique 255, 270 message long de free
 byte confign = 0;                   // position enregistrement config EEPROM
 byte recordn = 200;                 // position enregistrement log EEPROM
 byte RgePwmChanel = 0;
@@ -169,6 +183,7 @@ struct  config_t           // Structure configuration sauvée en EEPROM
   char    ftpUser[9];      // user ftp
   char    ftpPass[16];     // pwd ftp
   int     ftpPort;         // port ftp
+  int     TypeBatt;        // Type Batterie 16: Pb 6elts, 24 LiFePO 4elts
 } ;
 config_t config;
 
@@ -249,6 +264,7 @@ void setup() {
     config.FRgePWM       = 100;
     config.Tempofermeture = 20;
     config.Tempoouverture = 20;
+    config.TypeBatt       = 16; // Pb par défaut
     for (int i = 0; i < 10; i++) {// initialise liste PhoneBook liste restreinte
       config.Pos_Pn_PB[i] = 0;
     }
@@ -497,14 +513,17 @@ void Acquisition() {
   VBatterieProc   = map(adc_mm[1] / nSample, 0, 4095, 0, CoeffTension[1]);
   VUSB            = map(adc_mm[2] / nSample, 0, 4095, 0, CoeffTension[2]);
 
-  if (BattPBpct(TensionBatterie, 6) < 25 || VUSB < 4000) { // || VUSB > 6000
+  int etatbatt = 0;
+  if (config.TypeBatt == 16) etatbatt = BattPBpct(TensionBatterie, 6);
+  if (config.TypeBatt == 24) etatbatt = BattLiFePopct(TensionBatterie, 4);
+  if (etatbatt < 25 || VUSB < 4000) { // || VUSB > 6000
     nalaTension ++;
     if (nalaTension == 4) {
       FlagAlarmeTension = true;
       nalaTension = 0;
     }
   }
-  else if (BattPBpct(TensionBatterie, 6) > 80 && VUSB > 4500) { //  && VUSB < 5400	//hysteresis et tempo sur Alarme Batterie
+  else if (etatbatt >= 80 && VUSB >= 4500) { //  && VUSB < 5400	//hysteresis et tempo sur Alarme Batterie
     nRetourTension ++;
     if (nRetourTension == 4) {
       FlagAlarmeTension = false;
@@ -519,7 +538,8 @@ void Acquisition() {
   message = " Batt Solaire = ";
   message += float(TensionBatterie / 100.0);
   message += "V ";
-  message += String(BattPBpct(TensionBatterie, 6));
+  if (config.TypeBatt == 16) message += String(BattPBpct(TensionBatterie, 6));
+  if (config.TypeBatt == 24) message += String(BattLiFePopct(TensionBatterie, 4));
   message += "%";
   message += ", Batt Proc = ";
   message += String(VBatterieProc) + "mV ";
@@ -576,7 +596,7 @@ void traite_sms(byte slot) {
 
   char number[13];													// numero expediteur SMS
   String textesms;													// texte du SMS reçu
-  textesms.reserve(140);
+  textesms.reserve(270); // historique 140, 270 pour message long de free
   String numero;
   String nom;
   bool smsserveur = false; // true si le sms provient du serveur index=1
@@ -619,6 +639,21 @@ void traite_sms(byte slot) {
       }
       Serial.print("Nom appelant = "), Serial.println(nom);
       Serial.print("Numero = "), Serial.println(numero);
+      byte n = Sim800.ListPhoneBook(); // nombre de ligne PhoneBook
+      if(numero.length() < 8 || numero.length() > 20 
+        || numero == "Free Mobile" || numero.indexOf("Free") > -1){ // numero service free numero court et long(29) ou "Free Mobile"
+        for (byte Index = 1; Index < n + 1; Index++) { // Balayage des Num Tel dans Phone Book
+          if (config.Pos_Pn_PB[Index] == 1) { // Num dans liste restreinte
+            String number = Sim800.getPhoneBookNumber(Index);
+            char num[13];
+            number.toCharArray(num, 13);
+            message = textesms;
+            EnvoyerSms(num, true);
+            EffaceSMS(slot);
+            return; // sortir de la procedure traite_sms
+          }
+        }
+      }
     }
     else {
       textesms = String(replybuffer);
@@ -785,7 +820,8 @@ fin_i:
         message += "V Batt Sol= ";
         message += String(float(TensionBatterie / 100.0));
         message += "V, ";
-        message += String(BattPBpct(TensionBatterie, 6));
+        if (config.TypeBatt == 16) message += String(BattPBpct(TensionBatterie, 6));
+        if (config.TypeBatt == 24) message += String(BattLiFePopct(TensionBatterie, 4));
         message += " %";
         message += fl;
         message += "V USB= ";
@@ -1146,7 +1182,8 @@ fin_i:
           FlagCalibration = true;
 
           coef = CoeffTensionDefaut;
-          tension = map(moyenneAnalogique(P), 0, 4095, 0, coef);
+          tension = map(adc_mm[M-1] / nSample, 0, 4095, 0, coef);
+          // tension = map(moyenneAnalogique(P), 0, 4095, 0, coef);
           // Serial.print("TensionBatterie = "),Serial.println(TensionBatterie);
           tensionmemo = tension;
         }
@@ -1156,7 +1193,8 @@ fin_i:
           /* calcul nouveau coeff */
           coef = Sbidon.substring(0, 4).toFloat() / float(tensionmemo) * CoeffTensionDefaut;
           // Serial.print("Coeff Tension = "),Serial.println(coef);
-          tension = map(moyenneAnalogique(P), 0, 4095, 0, coef);
+          // tension = map(moyenneAnalogique(P), 0, 4095, 0, coef);
+          tension = map(adc_mm[M-1] / nSample, 0, 4095, 0, coef);
           CoeffTension[M - 1] = coef;
           FlagCalibration = false;
           Recordcalib();														// sauvegarde en SPIFFS
@@ -1176,7 +1214,8 @@ fin_i:
         if (M == 1) {
           message += fl;
           message += "Batterie = ";
-          message += String(BattPBpct(tension, 6));
+          if (config.TypeBatt == 16) message += String(BattPBpct(TensionBatterie, 6));
+          if (config.TypeBatt == 24) message += String(BattLiFePopct(TensionBatterie, 4));
           message += "%";
         }
         message += fl;
@@ -1527,6 +1566,37 @@ fin_i:
         }
         EnvoyerSms(number, sms);
       }
+      else if (textesms == "VIDELOG"){
+        SPIFFS.remove(filelog);
+        FileLogOnce = false;
+        message += "Effacement fichier log";
+        EnvoyerSms(number, sms);
+      }
+      else if (textesms.indexOf(F("SENDAT")) == 0){
+        // envoie commande AT au SIM800
+        // ex: SENDAT=AT+CCLK="23/07/19,10:00:20+04" mise à l'heure
+        // attention DANGEREUX pas de verification!
+        if (textesms.indexOf(char(61)) == 6) {
+          String CdeAT = textesms.substring(7, textesms.length());
+          String reply = sendAT(CdeAT,"OK","ERROR",1000);
+          // Serial.print("reponse: "),Serial.println(reply);
+          message += String(reply);
+          EnvoyerSms(number, sms);
+        }
+      }
+      else if (textesms.indexOf(F("TYPEBATT")) == 0){ // Type Batterie
+        if (textesms.indexOf(char(61)) == 8) {
+          int type = textesms.substring(9, textesms.length()).toInt();
+          if(type == 16 || type == 24){
+            config.TypeBatt = type;
+            sauvConfig();													// sauvegarde en EEPROM
+          }
+        }
+        message += "Type Batterie:" + fl;
+        if(config.TypeBatt == 16) message += "Pb 12V";
+        if(config.TypeBatt == 24) message += "LiFePO 12.8V";
+        EnvoyerSms(number, sms);
+      }
       //**************************************
       else {
         message += "message non reconnu !";
@@ -1579,7 +1649,8 @@ void envoieGroupeSMS(byte grp, bool m) {
     // Serial.print(F("Nombre de ligne PB=")),Serial.println(n);
     if (grp == 3) n = 1; // limite la liste à ligne 1
     for (byte Index = 1; Index < n + 1; Index++) { // Balayage des Num Tel dans Phone Book
-      if ((grp == 3) || (grp == 0 && config.Pos_Pn_PB[Index] == 0) || (grp == 1 && config.Pos_Pn_PB[Index] == 1)) {
+      // if ((grp == 3) || (grp == 0 && config.Pos_Pn_PB[Index] == 0) || (grp == 1 && config.Pos_Pn_PB[Index] == 1)) {
+      if ((grp == 3) || (grp == 0) || (grp == 1 && config.Pos_Pn_PB[Index] == 1)) {
         String number = Sim800.getPhoneBookNumber(Index);
         generationMessage(m);
         char num[13];
@@ -1618,12 +1689,14 @@ void generationMessage(bool n) {
   message += "Batterie : ";
   if (!FlagAlarmeTension) {
     message += "OK, ";
-    message += String(BattPBpct(TensionBatterie, 6));
+    if (config.TypeBatt == 16) message += String(BattPBpct(TensionBatterie, 6));
+    if (config.TypeBatt == 24) message += String(BattLiFePopct(TensionBatterie, 4));
     message += "%" + fl;
   }
   else {
     message += "Alarme, ";
-    message += String(BattPBpct(TensionBatterie, 6));
+    if (config.TypeBatt == 16) message += String(BattPBpct(TensionBatterie, 6));
+    if (config.TypeBatt == 24) message += String(BattLiFePopct(TensionBatterie, 4));
     message += "%";
     message += fl;
     message += "V USB =";
@@ -2077,6 +2150,9 @@ void PrintEEPROM() {
   Serial.print("Tempo fermeture (s) = ")     , Serial.println(config.Tempofermeture);
   Serial.print("Vitesse SlowBlinker = ")     , Serial.println(config.SlowBlinker);
   Serial.print("PWM Feux Rouge = ")          , Serial.println(config.FRgePWM);
+  Serial.print("Type Batterie = ");
+  if(config.TypeBatt == 16) Serial.println(F("Pb 12V 6elts"));
+  if(config.TypeBatt == 24) Serial.println(F("LiFePO 12.8V 4elts"));
   Serial.print("Liste Restreinte = ");
   for (int i = 1; i < 10; i++) {
     Serial.print(config.Pos_Pn_PB[i]);
@@ -2605,6 +2681,14 @@ void HomePage() {
   webpage += "<td>Debut Jour</td>";
   webpage += "<td>";	webpage += Hdectohhmm(config.DebutJour);	webpage += "</td>";
   webpage += "</tr>";
+
+  webpage += F("<tr>");
+  webpage += F("<td>Type Batterie</td>");
+  webpage += F("<td>");	
+  if(config.TypeBatt == 16) webpage += F("Pb 12V 6elts");
+  if(config.TypeBatt == 24) webpage += F("LiFePO 12.8V 4elts");
+  webpage += F("</td>");
+  webpage += F("</tr>");
 
   webpage += "<tr>";
   webpage += "<td>Anticipation WakeUp (s)</td>";
@@ -3225,6 +3309,31 @@ void GestionMessage_CVR() { // gestion message CVR
   } else {
     Serial.println(message);
   }
+}
+//---------------------------------------------------------------------------
+String sendAT(String ATcommand, String answer1, String answer2, unsigned int timeout){
+  byte reply = 1;
+  String content = "";
+  char character;
+
+  //Clean the modem input buffer
+  while(Serial2.available()>0) Serial2.read();
+
+  //Send the atcommand to the modem
+  Serial2.println(ATcommand);
+  delay(100);
+  unsigned int timeprevious = millis();
+  while((reply == 1) && ((millis() - timeprevious) < timeout)){
+    while(Serial2.available()>0) {
+      character = Serial2.read();
+      content.concat(character);
+      Serial.print(character);
+      delay(10);
+    }
+  }
+  // Serial.print("reponse: "),Serial.println(content);
+  // Serial.println("fin reponse");
+  return content;
 }
 /* --------------------  test local serial seulement ----------------------*/
 void recvOneChar() {
