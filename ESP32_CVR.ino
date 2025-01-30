@@ -4,12 +4,12 @@
 
   todo
   
-  V4-00 17/12/2024 Version LTE-M
+  V4-00 27/01/2025 Version LTE-M
   1- passage LTE-M
   2- Ajouter prise en compte cde DCVR1 -> OCVR1
   3- Ajouter commande avec/sans Allumage feu rouge si fermé
   Compilation LOLIN D32,default,80MHz, IMPORTANT ESP32 2.0.17
-  Arduino IDE 1.8.19 : 1093869 83%, 56208 17% sur PC IDE VSCODE
+  Arduino IDE 1.8.19 : 1097177 83%, 56080 17% sur PC IDE VSCODE
   Arduino IDE 1.8.19 : x 77%, x 14% sur raspi (sans ULP)
 
   V1-3 22/03/2024 installé CVR1
@@ -65,15 +65,14 @@
 String ver        = "V4-00";
 int    Magique    = 4;
 
-#define Exploitation // si defini pour Exploitation, sinon Test
 #define TINY_GSM_MODEM_SIM7000
+#define Exploitation           // selection des données serveur dans fichier credentials
 
 #include <Battpct.h>
 #include "defs.h"
-#include <TinyGsmClient.h>         // librairie TinyGSM revue PhC 0.12.0
+#include <TinyGsmClient.h>         // librairie TinyGSM revue PhC 10.12.0
 #include <PubSubClient.h>
 #include <TimeAlarms.h>
-// #include <sys/time.h>             //<sys/time.h>
 #include <WiFi.h>
 #include <SPIFFS.h>
 #include <ArduinoOTA.h>
@@ -108,8 +107,8 @@ bool    SPIFFS_present = false;
 #define PinFerme      21   // Sortie Commande Fermeture CVR
 #define PinFeuxR      19   // Sortie Commande Feux Rouge
 #define PinOuvre      15   // Sortie Commande Ouverture CVR
-#define RX_PIN        16   // TX Sim7000
-#define TX_PIN        17   // RX Sim7000
+#define RX_PIN        17   // TX Sim7000
+#define TX_PIN        16   // RX Sim7000
 #define PinReset      13   // Reset Hard
 #define PinTest       27   // Test sans GSM cc a la masse
 
@@ -171,6 +170,7 @@ int CoeffTensionDefaut     = 7000;       // Coefficient par defaut
 bool firstdecision         = false;      // true si premiere décision apres lancement
 bool flagRcvMQTT           = false;      // true si reception MQTT longueur>0, false longueur = 0
 bool Online                = false;      // true si network && Gprs && mqtt && subscribe
+bool FlagSetTime           = false;      // flag set time valide
 long TensionBatterie       = 0;          // Tension Batterie solaire
 long VBatterieProc         = 0;          // Tension Batterie Processeur
 long VUSB                  = 0;          // Tension USB
@@ -191,14 +191,6 @@ PubSubClient  mqttClient(client);
 WebServer server(80);
 File UploadFile;
 
-typedef struct               // declaration structure  pour les log
-{
-  char    dt[10];            // DateTime 0610-1702 9+1
-  char    Act[2];            // Action A/D/S/s 1+1
-  char    Name[15];          // 14 car
-} champ;
-champ record[5];
-
 struct  config_t           // Structure configuration sauvée en SPIFFS
 {
   int     magic;           // num magique
@@ -211,7 +203,6 @@ struct  config_t           // Structure configuration sauvée en SPIFFS
   int     FRgePWM;         // Modulation Feux Rouge %
   int     Tempoouverture;  // Tempo ouverture verin
   int     Tempofermeture;  // Tempo fermeture verin
-  bool    Pos_Pn_PB[10];   // numero du Phone Book (1-9) à qui envoyer 0/1 0 par defaut
   char    Idchar[11];      // Id
   char    apn[11];         // APN
   char    gprsUser[11];    // user for APN
@@ -245,7 +236,6 @@ int Histo_Reseau[5]={0,0,0,0,0};  // Historique Reseau cumul chaque mise à l'he
 Ticker SlowBlink;          // Clignotant lent
 Ticker step;               // pas modulation pwm feux
 Ticker ADC;                // Lecture des Adc
-
 AlarmId loopPrincipale;    // boucle principale
 AlarmId DebutJour;         // Debut journée
 AlarmId FinJour;           // Fin de journée retour deep sleep
@@ -253,7 +243,9 @@ AlarmId Aouverture;        // Tempo ouverture verin
 AlarmId Afermeture;        // Tempo fermeture verin
 
 //---------------------------------------------------------------------------
-void MajHeure(bool force = false);
+// newtime = "" mise à l'heure NTP
+// newtime = "YY/MM/DD,hh:mm:ss" mise à l'heure reçue
+bool MajHeure(String newtime = "");
 //---------------------------------------------------------------------------
 void setup() {
   message.reserve(300); // texte des reponses
@@ -281,6 +273,7 @@ void setup() {
   adcAttachPin(PinBattProc);
   adcAttachPin(PinBattSol);
   adcAttachPin(PinBattUSB);
+
   if (digitalRead(PinTest) == 0) { // lire strap test, si = 0 test sans carte gsm
     gsm = false;
     setTime(12, 00, 00, 15, 07, 2019); // il faut initialiser la date et heure, jour circule et midi
@@ -302,7 +295,7 @@ void setup() {
     modem.setPreferredMode(1); // Mode CAT-M
     modem.disableGPS();        // Arret GPS
   }
-  // parametrage PWM pour les feux
+  // parametrage PWM pour le feu Rouge
   // https://randomnerdtutorials.com/esp32-pwm-arduino-ide/
   ledcSetup(RgePwmChanel, 1000, 8);
   ledcAttachPin(PinFeuxR, RgePwmChanel);
@@ -336,9 +329,6 @@ void setup() {
     config.keepAlive     = 300; // 5mn, IMPERATIF pour réduire conso data
     config.autoupload    = false;
     config.cptAla        = 10; // 11*Acquisition time
-    for (int i = 0; i < 10; i++) {// initialise liste PhoneBook liste restreinte
-      config.Pos_Pn_PB[i] = 0;
-    }
     String temp          = "TPCF_CVR1";
     temp.toCharArray(config.Idchar, 11);
     String tempapn       = "eapn1.net";
@@ -346,22 +336,22 @@ void setup() {
     String tempGprsPass  = "";
     config.ftpPort       = tempftpPort;
     tempapn.toCharArray(config.apn, (tempapn.length() + 1));
-    tempGprsUser.toCharArray(config.gprsUser, (tempGprsUser.length() + 1));
-    tempGprsPass.toCharArray(config.gprsPass, (tempGprsPass.length() + 1));
-    tempServer.toCharArray(config.ftpServeur, (tempServer.length() + 1));
-    tempftpUser.toCharArray(config.ftpUser, (tempftpUser.length() + 1));
-    tempftpPass.toCharArray(config.ftpPass, (tempftpPass.length() + 1));
+    tempGprsUser.toCharArray(config.gprsUser,(tempGprsUser.length() + 1));
+    tempGprsPass.toCharArray(config.gprsPass,(tempGprsPass.length() + 1));
+    tempServer.toCharArray(config.ftpServeur,(tempServer.length() + 1));
+    tempftpUser.toCharArray(config.ftpUser,(tempftpUser.length() + 1));
+    tempftpPass.toCharArray(config.ftpPass,(tempftpPass.length() + 1));
     tempServer.toCharArray(config.mqttServer, (tempServer.length() + 1));
     tempmqttUserName.toCharArray(config.mqttUserName, (tempmqttUserName.length() + 1));
     tempmqttPass.toCharArray(config.mqttPass, (tempmqttPass.length() + 1));
     copie_Topic();
     
-    sauvConfig();
-    
+    sauvConfig();   
   }
   PrintConfig();
 
   strncpy(willTopic,("S/will"),sizeof(willTopic));// topic commun
+
   Id  = String(config.Idchar);
   Id += fl;
 
@@ -383,7 +373,8 @@ void setup() {
   })
   .onEnd([]() {
     Serial.println("End");
-    delay(100);
+    delay(1000);
+    ESP.restart();
     ResetHard();
   })
   .onProgress([](unsigned int progress, unsigned int total) {
@@ -430,15 +421,16 @@ void setup() {
     mqttClient.setServer(config.mqttServer, config.mqttPort); // Set the MQTT broker details.
     mqttClient.setCallback(mqttSubscriptionCallback);         // Set the MQTT message handler function.
 
-    // Synchro heure réseau du modem
-    Serial.println(F("Synchro Heure réseau "));
-    if(SyncHeureModem(config.hete*4, true)){ // heure été par defaut, first time
-      Serial.println(F("OK"));
-    } else {Serial.println(F("KO"));}
-    Serial.println(modem.getGSMDateTime(TinyGSMDateTimeFormat(0)));
-
+    // Synchro heure
+    readmodemtime();           // Lecture heure modem
+    // set modem Localtime
+    Serial.println("set CLTS=1:"),Serial.println(modem.send_AT("+CLTS=1"));
     timesstatus();								// Etat synchronisation Heure Sys
-    MajHeure();
+    // sync Heure system avec modem (si Heure modem valide)
+    // place FlagSetTime=true si Ok, sinon relancer dans la boucle
+    set_system_time();
+    timesstatus();								// Etat synchronisation Heure Sys
+    Serial.print("Syst Time ="),Serial.println(displayTime(0));
   }
 
   loopPrincipale = Alarm.timerRepeat(10, Acquisition); // boucle principale 10s
@@ -473,15 +465,24 @@ void loop() {
     t0 = millis();
     Check_Online();
   }
+
   recvOneChar(); // Capture reception liaison serie locale
 
-  mqttClient.loop(); // Call the loop to maintain connection to the server.
+  if(Online){
+    mqttClient.loop(); // Call the loop to maintain connection to the server.
+  }
 
   ArduinoOTA.handle();
   Alarm.delay(0);
 }	//fin loop
 //---------------------------------------------------------------------------
 void Acquisition() {
+
+  if (!FlagSetTime){ // si mise à l'heure non valide
+    StartStopAlarme(false);
+    set_system_time();
+    StartStopAlarme(true);
+  }
 
   Serial.print("position CVR:");
   switch (Position_CVR()) {
@@ -508,7 +509,14 @@ void Acquisition() {
       break;
   }
   Serial.print("Demande en attente:"), Serial.println(FlagDemande_CVR);
-
+  static byte lastminute = minute();
+  if(minute() == 0 && minute()!=lastminute){
+    lastminute = minute();
+    Monitoring_Reseau();
+    Serial.println("monitoring reseau");
+  } else {
+    lastminute = minute();
+  }
   static int cpt = 0; // compte le nombre de passage boucle
   
   static byte nalaPosition = 0;
@@ -679,8 +687,7 @@ void Acquisition() {
 }
 //---------------------------------------------------------------------------
 // check if we are Oline
-void Check_Online(){
-  static bool lastOnline = false;  
+void Check_Online(){  
   static int cptRegStatusFault = 0; // compteur defaut network
   bool net_status  = false;
   bool gprs_status = false;
@@ -719,19 +726,23 @@ void Check_Online(){
   Sbidon += "Online,res,gprs,mqtt,nRegFault :" + String(Online) + ":" + String(net_status) + ":" + String(gprs_status);
   Sbidon += ":" + String(mqtt_status) + ":" + String(cptRegStatusFault) + fl;
   Serial.print(Sbidon);
-  Serial.print(modem.getOperator());
-  IPAddress local = modem.localIP();
-  Serial.println("; IP:" + local.toString());
+  if(net_status){
+    Serial.print(modem.getOperator());
+    IPAddress local = modem.localIP();
+    Serial.println("; IP:" + local.toString());
+  }
 
   // Patch Blocage modem
   if(! net_status){
-    if(cptRegStatusFault ++ > 24){ // si hors réseau > 24*5s
+    if(cptRegStatusFault ++ > 24){ // si hors réseau > 24*5s=120s
       cptRegStatusFault = 0;
       NbrResetModem +=1;
       Sbidon = "Reset modem suite Reg status fault" + String(cptRegStatusFault);
       Serial.println(Sbidon);
-      modem.send_AT(F("+CFUN=1,1"));
-      delay(10000);
+      if(modem.setPhoneFunctionality(1,1)){// CFUN=1,1 full functionality, reset online mode
+        modem.setNetworkMode(38);  // Network Mode LTE
+        modem.setPreferredMode(1); // Mode CAT-M
+      }
     }
   } else {
     cptRegStatusFault = 0;// reset compteur
@@ -770,13 +781,11 @@ void traite_sms(String Origine) {
   if (Origine == "MQTTS") smsserveur = true;
   
   /* Variables pour mode calibration */
-  static int tensionmemo = 0;//	memorisation tension batterie lors de la calibration
-  int coef = 0; // coeff temporaire
-  static byte P = 0; // Pin entrée a utiliser pour calibration
-  static byte M = 0; // Mode calibration 1,2,3,4
+  static int tensionmemo = 0;           //	memorisation tension batterie lors de la calibration
+  int coef = 0;                         // coeff temporaire
+  static byte P = 0;                    // Pin entrée a utiliser pour calibration
+  static byte M = 0;                    // Mode calibration 1,2,3,4
   static bool FlagCalibration = false;	// Calibration Tension en cours
-
-  Serial.print("message: "), Serial.print(Rmessage),Serial.print(","),Serial.println(Rmessage.length());
 
   if (!(Rmessage.indexOf(F("TEL")) == 0 || Rmessage.indexOf(F("tel")) == 0 || Rmessage.indexOf(F("Tel")) == 0
       || Rmessage.indexOf(F("Wifi")) == 0
@@ -809,10 +818,16 @@ void traite_sms(String Origine) {
   else if (Rmessage.indexOf("Wifi") == 0) { // demande connexion Wifi
     byte pos1 = Rmessage.indexOf(char(44));//","
     byte pos2 = Rmessage.indexOf(char(44), pos1 + 1);
+    if(pos1==255 || pos1<4 || pos2==255 || pos2<4){
+      // format incomplet
+      message += "erreur format";
+      sendReply(Origine);
+      return;
+    }
     String ssids = Rmessage.substring(pos1 + 1, pos2);
     String pwds  = Rmessage.substring(pos2 + 1, Rmessage.length());
-    char ssid[20];
-    char pwd[20];
+    char ssid[25];
+    char pwd[30];
     ssids.toCharArray(ssid, ssids.length() + 1);
     ssids.toCharArray(ssid, ssids.length() + 1);
     pwds.toCharArray(pwd, pwds.length() + 1);
@@ -950,7 +965,15 @@ fin_tel:
     if (temp.length() > 0 && temp.length() < 11) {
       Id = "";
       temp.toCharArray(config.Idchar, 11);
-      sauvConfig();														// sauvegarde en SPIFFS
+      mqttSubscribe(1); // unsubscribe
+      mqttClient.disconnect();
+
+      copie_Topic(); // Nouvel Id dans Topic
+      sauvConfig();														// sauvegarde config
+
+      mqttConnect();
+      mqttSubscribe(0); // subscribe
+
       Id = String(config.Idchar);
       Id += fl;
     }
@@ -959,15 +982,11 @@ fin_tel:
     message += fl;
     sendReply(Origine);
   }
-  else if (Rmessage.indexOf("LOG") == 0) {	// demande log des 5 derniers commandes
-    File f = SPIFFS.open(filelog, "r"); // taille du fichier log en SPIFFS
-    message = "local log size :";
+  else if (Rmessage.indexOf("LOG") == 0) { // demande taille du log
+    File f = SPIFFS.open(filelog, "r");    // taille du fichier log en SPIFFS
+    message = F("local log size :");
     message += String(f.size()) + fl;
     f.close();
-    for (int i = 0; i < 5; i++) {
-      message += String(record[i].dt) + "," + String(record[i].Act) + "," + String(record[i].Name) + fl;
-    }
-    //Serial.println( message);
     sendReply(Origine);
   }
   else if (Rmessage.indexOf("ANTICIP") > -1) { // Anticipation du wakeup
@@ -1008,14 +1027,32 @@ fin_tel:
     sendReply(Origine);
   }
   else if (Rmessage.indexOf(F("MAJHEURE")) == 0) {	//	forcer mise a l'heure
-    MajHeure(true);			// mise a l'heure forcée
     messageId();
-    message += "Mise à l'heure NTP";
+    if (Rmessage.indexOf(char(61)) == 8) {
+      Sbidon = Rmessage.substring(9,Rmessage.length());      
+      if (Sbidon.length()== 17){
+        if (MajHeure(Sbidon)){	// mise a l'heure demandée
+          messageId();
+          message += "Mise à l'heure OK";
+        } else {
+          message += "Erreur mise à l'heure";
+        }
+      }
+    } else {
+      MajHeure("");			// mise a l'heure NTP
+      messageId();
+      message += "Mise à l'heure NTP";
+    }  
     sendReply(Origine);
   }
   else if (gsm && Rmessage.indexOf(F("IMEI")) > -1) {
     message += F("IMEI = ");
     message += modem.getIMEI();
+    sendReply(Origine);
+  }
+  else if (gsm && Rmessage.indexOf(F("CCID")) > -1) {
+    message += F("CCID = ");
+    message += modem.getSimCCID();
     sendReply(Origine);
   }
   else if (Rmessage.indexOf("FIN") == 0) {			//	Heure Fin de journée
@@ -1039,15 +1076,13 @@ fin_tel:
     /* mise a jour calendrier ;format : MOIS=mm,31 fois 0/1
       demande calendrier pour un mois donné ; format : MOIS=mm? */
     bool flag = true; // validation du format
-    bool W = true; // true Write, false Read
+    bool W = true;    // true Write, false Read
     int m = 0;
     if (Rmessage.indexOf("{") == 0) { // json
-      DynamicJsonDocument doc(540);
+      JsonDocument doc;
       int f = Rmessage.lastIndexOf("}");
-      // Serial.print("pos }:"),Serial.println(f);
-      // Serial.print("json:"),Serial.print(Rmessage.substring(0,f+1)),Serial.println(".");,1,1,1,1,1,0,0,0,0,0,0]}";
       DeserializationError err = deserializeJson(doc, Rmessage.substring(0, f + 1));
-      if (!err) {
+      if(!err){
         m = doc["MOIS"]; // 12
         JsonArray jour = doc["JOUR"];
         for (int j = 1; j < 32; j++) {
@@ -1055,11 +1090,8 @@ fin_tel:
         }
         // Serial.print("mois:"),Serial.println(m);
         EnregistreCalendrier(); // Sauvegarde en SPIFFS
-        // message += F("Mise a jour calendrier \nmois:");
-        // message += m;
-        // message += " OK (json)";
       }
-      else {
+      else{
         message += " erreur json ";
         flag = false;
       }
@@ -1073,10 +1105,6 @@ fin_tel:
       }
 
       m = Rmessage.substring(p1 + 1, p2).toInt(); // mois
-
-      // printf("p1=%d,p2=%d\n",p1,p2);
-      // Serial.println(Rmessage.substring(p1+1,p2).toInt());
-      // Serial.println(Rmessage.substring(p2+1,Rmessage.length()).length());
       if (!(m > 0 && m < 13)) flag = false;
       if (W && flag) { // Write
         if (!(Rmessage.substring(p2 + 1, Rmessage.length()).length() == 31)) flag = false; // si longueur = 31(jours)
@@ -1093,9 +1121,6 @@ fin_tel:
             // Serial.print(Rmessage.substring(p2+i,p2+i+1));
           }
           EnregistreCalendrier(); // Sauvegarde en SPIFFS
-          // message += F("Mise a jour calendrier mois:");
-          // message += m;
-          // message += " OK";
         }
       }
       if (!flag) {
@@ -1106,22 +1131,15 @@ fin_tel:
     if (flag) { // demande calendrier pour un mois donné
       if (smsserveur || !sms) {
         // si serveur reponse json  {"mois":12,"jour":[1,2,4,5,6 .. 31]}
-        DynamicJsonDocument doc(540);
+        JsonDocument doc;
         doc["mois"] = m;
-        JsonArray jour = doc.createNestedArray("jour");
+        JsonArray jour = doc["jour"].to<JsonArray>();
         for (int i = 1; i < 32; i++) {
           jour.add(calendrier[m][i]);
         }
         String jsonbidon;
         serializeJson(doc, jsonbidon);
         message += jsonbidon;
-        // message +="{\"mois\":" + String(m) + "," +fl;
-        // message += "\"jour\":[";
-        // for (int i = 1; i < 32 ; i++){
-        // message += String(calendrier[m][i]);
-        // if (i < 31) message += ",";
-        // }
-        // message += "]}";
       }
       else {
         message += "mois = ";
@@ -1191,47 +1209,6 @@ fin_tel:
     }
     message += "Tempo repetition Wake up (s)=";
     message += config.RepeatWakeUp;
-    sendReply(Origine);
-  }
-  else if (Rmessage.indexOf("LST2") > -1) { //	Liste restreinte	//  =LST2=0,0,0,0,0,0,0,0,0
-    bool flag = true; // validation du format
-    if (Rmessage.indexOf(char(61)) == 4) { // "="
-      byte Num[10];
-      Sbidon = Rmessage.substring(5, 22);
-      // Serial.print("bidon="),Serial.print(Sbidon),Serial.print("="),Serial.println(Sbidon.length());
-      if (Sbidon.length() == 17) {
-        int j = 1;
-        for (int i = 0; i < 17; i += 2) {
-          if (i == 16 && (Sbidon.substring(i, i + 1) == "0"	|| Sbidon.substring(i, i + 1) == "1")) {
-            Num[j] = Sbidon.substring(i, i + 1).toInt();
-          }
-          else if ((Sbidon.substring(i + 1, i + 2) == ",") && (Sbidon.substring(i, i + 1) == "0"	|| Sbidon.substring(i, i + 1) == "1")) {
-            //Serial.print(",="),Serial.println(bidon.substring(i+1,i+2));
-            //Serial.print("X="),Serial.println(bidon.substring(i,i+1));
-            Num[j] = Sbidon.substring(i, i + 1).toInt();
-            //Serial.print(i),Serial.print(","),Serial.print(j),Serial.print(","),Serial.println(Num[j]);
-            j++;
-          }
-          else {
-            Serial.println("Format pas reconnu");
-            flag = false;
-          }
-        }
-        if (flag) {
-          //Serial.println("copie des num");
-          for (int i = 1; i < 10; i++) {
-            config.Pos_Pn_PB[i] = Num[i];
-          }
-          sauvConfig();															// sauvegarde en SPIFFS
-        }
-      }
-    }
-    message += "Liste restreinte";
-    message += fl;
-    for (int i = 1; i < 10; i++) {
-      message += config.Pos_Pn_PB[i];
-      if ( i < 9) message += char(44); // ,
-    }
     sendReply(Origine);
   }
   else if (Rmessage == "RST" || Rmessage == "RESET") {               // demande RESET
@@ -1306,7 +1283,6 @@ fin_tel:
       /* calcul nouveau coeff */
       coef = Sbidon.substring(0, 4).toFloat() / float(tensionmemo) * CoeffTensionDefaut;
       // Serial.print("Coeff Tension = "),Serial.println(coef);
-      // tension = map(moyenneAnalogique(P), 0, 4095, 0, coef);
       tension = map(adc_mm[M-1] / nSample, 0, 4095, 0, coef);
       CoeffTension[M - 1] = coef;
       FlagCalibration = false;
@@ -1505,7 +1481,7 @@ fin_tel:
       byte p1 = 0;
       byte p2 = 0;
       bool flag = true;
-      for(int i = 0; i < 4; i++){          
+      for(int i = 0; i < (sizeof(CoeffTension) / sizeof(CoeffTension[0])); i++){          
         // printf("i=%d,p1=%d,p2=%d\n",i,p1,p2);
         p2 = Sbidon.indexOf(char(44), p1 + 1); // ,
         tempo[i] = Sbidon.substring(p1,p2).toInt();
@@ -1515,16 +1491,16 @@ fin_tel:
         // printf("i=%d,p1=%d,p2=%d\n",i,p1,p2);
       }
       if (flag){ // format OK
-        for(int i = 0; i < 4; i++){
+        for(int i = 0; i < (sizeof(CoeffTension) / sizeof(CoeffTension[0])); i++){
           CoeffTension[i] = tempo[i];
         }
         Recordcalib(); // enregistre en SPIFFS
       }
     }
     message += "Coeff calibration:" + fl;
-    for(int i = 0; i < 4; i++){
+    for(int i = 0; i < (sizeof(CoeffTension) / sizeof(CoeffTension[0])); i++){
       message += String(CoeffTension[i]);
-      if(i < 3 ) message += ",";
+      if(i < (sizeof(CoeffTension) / sizeof(CoeffTension[0])- 1) ) message += ",";
     }
     Serial.println(message);
     sendReply(Origine);
@@ -1636,6 +1612,103 @@ fin_tel:
     message += "\n au prochain demarrage";
     sendReply(Origine);
   }
+  else if (Rmessage.indexOf("MQTTDATA") > -1) {
+    // Parametres MQTTDATA=serveur:user:pass:port
+    // {"MQTTDATA":{"serveur":"xxxx.org","user":"uuu","pass":"passpass","port":9999}}
+
+    bool erreur = false;
+    // bool formatsms = false;
+    if (Rmessage.indexOf(":") == 11) { // format json
+      JsonDocument doc; //https://arduinojson.org/v7/assistant/#/step1
+      DeserializationError err = deserializeJson(doc, Rmessage);
+      if (err) {
+        erreur = true;
+      }
+      else {
+        JsonObject mqttdata = doc["MQTTDATA"];
+        strncpy(config.mqttServer,     mqttdata["serveur"], 26);
+        strncpy(config.mqttUserName,   mqttdata["user"]   , 11);
+        strncpy(config.mqttPass,       mqttdata["pass"]   , 16);
+        config.mqttPort            =   mqttdata["port"];
+        sauvConfig();
+      }
+    }
+    
+    if (!erreur) {
+      JsonDocument doc;
+      JsonObject MQTTDATA = doc["MQTTDATA"].to<JsonObject>();
+      MQTTDATA["serveur"] = config.mqttServer;
+      MQTTDATA["user"]    = config.mqttUserName;
+      MQTTDATA["pass"]    = config.mqttPass;
+      MQTTDATA["port"]    = config.mqttPort;
+      
+      Sbidon = "";
+      serializeJson(doc, Sbidon);
+      message += Sbidon;
+      message += fl;
+    }
+    else {
+      message += "Erreur format";
+      message += fl;
+    }
+    sendReply(Origine);
+  }
+  else if (Rmessage.indexOf("TOPIC") > -1) { // MQTT Topic
+    // Parametres TOPIC="sendTopic":"sendtopic0,sendtopic1","recvTopic":"recvtopic0,recvtopic1"
+    //"{"TOPIC":{"sendTopic0": "sendtopic0", "sendTopic1": "sendtopic1","recvTopic0":"recvtopic0","recvTopic1":"recvtopic1"}}"
+    
+    bool erreur = false;
+    if (Rmessage.indexOf(":") == 8) { // format json
+      JsonDocument doc;
+      DeserializationError err = deserializeJson(doc, Rmessage);
+      if (err) {
+        erreur = true;
+      }
+      else {
+        JsonObject TOPIC = doc["TOPIC"];
+        strncpy(config.sendTopic[0],TOPIC["sendTopic0"],12);
+        strncpy(config.sendTopic[1],TOPIC["sendTopic1"],12);
+        strncpy(config.recvTopic[0],TOPIC["recvTopic0"],12);
+        strncpy(config.recvTopic[1],TOPIC["recvTopic1"],12);
+        sauvConfig();
+        copie_Topic();
+      }
+    }
+    if (!erreur){
+      JsonDocument doc;
+      JsonObject TOPIC = doc["TOPIC"].to<JsonObject>();
+      
+      TOPIC["sendTopic0"] = config.sendTopic[0];
+      TOPIC["sendTopic1"] = config.sendTopic[1];
+      TOPIC["recvTopic0"] = config.recvTopic[0];
+      TOPIC["recvTopic1"] = config.recvTopic[1];
+
+      Sbidon = "";
+      serializeJson(doc, Sbidon);
+      message += Sbidon;
+      message += fl;
+    }
+    else {
+      message += "Erreur format";
+      message += fl;
+    }
+    sendReply(Origine);
+  }
+  else if (Rmessage.indexOf("MQTTSERVEUR") == 0) { // Serveur MQTT
+    // case sensitive
+    // MQTTSERVEUR=abcd.org
+    if (Rmessage.indexOf(char(61)) == 11) {
+      Sbidon = Rmessage.substring(12);
+      Serial.print("mqttserveur:"),Serial.print(Sbidon);
+      Serial.print(" ,"), Serial.println(Sbidon.length());
+      Sbidon.toCharArray(config.mqttServer, (Sbidon.length() + 1));
+      sauvConfig();
+    }
+    message += F("MQTTserveur =");
+    message += String(config.mqttServer);
+    message += F("\n au prochain demarrage");
+    sendReply(Origine);
+  }
   else if (Rmessage.indexOf("GPRSDATA") > -1) {
     // Parametres GPRSDATA = "APN":"user":"pass"
     // GPRSDATA="sl2sfr":"":""
@@ -1733,6 +1806,43 @@ fin_tel:
     message += "Effacement fichier log";
     sendReply(Origine);
   }
+  else if (Rmessage.indexOf("AUTOUPLOAD") == 0){ // Auto upload log vers serveur FTP
+    message += "Fonction non active";
+    // if (Rmessage.indexOf(char(61)) == 10) {
+    //   byte c = Rmessage.substring(11).toInt();
+    //   if(c==0 || c==1){
+    //     config.autoupload = c;
+    //     sauvConfig();
+    //   }
+    // }
+    // message += "Autoupload:";
+    // message += String(config.autoupload);
+    sendReply(Origine);
+  }
+  else if (Rmessage.indexOf(F("CPTALATRCK")) == 0 || Rmessage.indexOf(F("CPTALA")) == 0) { // Compteur Ala avant Flag
+    if (Rmessage.indexOf(char(61)) == 10) {
+      int c = Rmessage.substring(11).toInt();
+      if (c > 1 && c < 501) {
+        config.cptAla = c;
+        sauvConfig();
+      }
+    }
+    message += F("Cpt Ala Tracker (x10s)=");
+    message += String(config.cptAla);
+    message += fl;
+    sendReply(Origine);
+  }
+  else if (Rmessage.indexOf(F("SETNETWORKMODE")) >= 0) {// Set Prefered network Mode
+    if(Rmessage.indexOf(char(61)) == 14){
+      int mode = Rmessage.substring(15).toInt();
+      if(mode == 2 || mode == 13 || mode == 38 || mode == 51){
+        modem.setNetworkMode(mode);
+        delay(1000);
+      }
+    }
+    message += String(modem.send_AT(F("+CNMP?")));
+    sendReply(Origine);
+  }
   else if (Rmessage.indexOf(F("SENDAT")) == 0){
     // envoie commande AT au SIM7000
     // ex: SENDAT=AT+CCLK="23/07/19,10:00:20+04" mise à l'heure
@@ -1773,12 +1883,30 @@ fin_tel:
     if(config.TypeBatt == 24) message += "LiFePO 12.8V";
     sendReply(Origine);
   }
+  else if (Rmessage.indexOf("AUTORISATIONSMS") == 0) {
+    // Autorisation envoie SMS
+    if (Rmessage.indexOf(char(61)) == 15) {
+      int i = Rmessage.substring(16).toInt();
+      if (i == 0){
+        config.sendSMS = 0;
+      } else if (i == 1){
+        config.sendSMS = 1;
+      }
+      sauvConfig();													// sauvegarde config
+      Sbidon = F("Autorisation SMS=");
+      Sbidon += String(config.sendSMS);
+      MajLog(Origine, Sbidon);// renseigne log
+    }
+    message += "Autorisation SMS : ";
+    message += String(config.sendSMS);
+    sendReply(Origine);
+  }
   else if (Rmessage.indexOf(F("FEUROUGE")) == 0){ // Avec/sans allumage du feu rouge si fermé
     if (Rmessage.indexOf(char(61)) == 8) {
       if(Rmessage.substring(9, Rmessage.length()).toInt() == 1){
         FlagDemandeAllume = true;
       } else {
-        FlagDemandeAllume = false;
+        FlagDemandeAllume = false;        
         ledcWrite(RgePwmChanel, 0); // Extinction Feux Rouge
         Allume = false;
         SlowBlink.detach();
@@ -1790,6 +1918,7 @@ fin_tel:
       message += "Sans Feu Rouge Allume";
     }
     sendReply(Origine);
+    if (FlagDemandeAllume) Acquisition(); // Allumage au passage dans Acquisition
   }
   //**************************************
   else {
@@ -1821,15 +1950,8 @@ void envoie_alarme() {
 //---------------------------------------------------------------------------
 void envoieGroupeMessage(bool vie, bool Serveur) {
   generationMessage();
-    /* m=0 message normal/finanalyse
-    	si grp = 0,
-      envoie un SMS à tous les numero existant (9 max) du Phone Book
-    	SAUF ceux de la liste restreinte
-      si grp = 1,
-      envoie un SMS à tous les numero existant (9 max) du Phone Book
-      de la liste restreinte config.Pos_Pn_PB[x]=1
-      si grp = 3,
-      Message au Serveur seulement N°1 de la liste			*/
+  if (vie) { 						// si envoie Etat demandé
+  }
   if(config.sendSMS){
   // A Finir 
   }
@@ -1955,63 +2077,30 @@ void Envoyer_MQTT(bool dest){
   } else {Serial.println("Off Line");}
 }
 //---------------------------------------------------------------------------
-void MajHeure(bool force) {
-  // force = true, force mise à l'heure systeme sur heure modem, meme si defaut NTP
-  // Monitoring_Reseau();
-  static bool First = true;
-  if (gsm) {
-    Serial.print(F("Mise a l'heure reguliere !, "));
-    Serial.println(First);
-    if (First) {															  // premiere fois apres le lancement
+// newtime = "" mise à l'heure NTP
+// newtime = "YY/MM/DD,hh:mm:ss" mise à l'heure reçue
+bool MajHeure(String newtime){
+  if(newtime.length() == 0){ // mise à l'heure NTP
+    if(HeureEte()){
       SyncHeureModem(config.hete*4, true);
-      readmodemtime();	// lire l'heure du modem
-      setTime(N_H,N_m, N_S, N_D, N_M, N_Y);	    // mise à l'heure de l'Arduino
-      if(!HeureEte()){
-        // Serial.print("NTP:"),Serial.println(modem.NTPServerSync(NTPServer, config.hhiver*4));
-        SyncHeureModem(config.hhiver*4, true);
-        readmodemtime();	// lire l'heure du modem
-        setTime(N_H,N_m, N_S, N_D, N_M, N_Y);	    // mise à l'heure de l'Arduino
-      }
-      First = false;
+    } else {
+      SyncHeureModem(config.hhiver*4, true);
     }
-    else {
-      // calcul décalage entre H sys et H reseau en s
-      // resynchroniser H modem avec reseau
-      if(HeureEte()){
-        // Serial.print("NTP:"),Serial.println(modem.NTPServerSync(NTPServer, config.hete*4));
-        if(!SyncHeureModem(config.hete*4, false)){
-          if(!force)return; // sortie sans mise à l'heure, continue si forcé
-        }
-      } else {
-        // Serial.print("NTP:"),Serial.println(modem.NTPServerSync(NTPServer, config.hhiver*4));
-        if(!SyncHeureModem(config.hhiver*4, false)){
-          if(!force)return; // sortie sans mise à l'heure, continue si forcé
-        }
-      }
-      readmodemtime();	// lire l'heure du modem
-      //  calcul décalage entre H sys et H reseau en s
-      int ecart = (N_H - hour()) * 3600;
-      ecart += (N_m - minute()) * 60;
-      ecart += N_S - second();
-      // ecart += 10;
-      Serial.print(F("Ecart s= ")), Serial.println(ecart);
-      if (abs(ecart) > 5) {
-        Alarm.disable(loopPrincipale);
-        Alarm.disable(DebutJour);
-        Alarm.disable(FinJour);
-
-        readmodemtime();	// mise à l'heure de l'Arduino
-        setTime(N_H,N_m, N_S, N_D, N_M, N_Y);	    // mise à l'heure de l'Arduino
-
-        Alarm.enable(loopPrincipale);
-        Alarm.enable(DebutJour);
-        Alarm.enable(FinJour);
-      }
-    }
+    StartStopAlarme(false);
+    set_system_time(); // Set systeme time to modem time
+    StartStopAlarme(true);
+    return true;
+  } else if(newtime.length() == 17){ // mise à l'heure reçue, long OK
+    newtime.replace(","," ");
+    Sbidon = "AT+CCLK=\"" + newtime + "\"";
+    modem.send_AT(Sbidon);
+    StartStopAlarme(false);
+    set_system_time();  // Set systeme time to modem time
+    StartStopAlarme(true);
+    return true;
+  } else { // format non reconnu
+    return false;
   }
-  displayTime(0);
-  timesstatus();
-  AIntru_HeureActuelle();
 }
 //---------------------------------------------------------------------------
 long DureeSleep(long Htarget) { // Htarget Heure de reveil visée
@@ -2040,11 +2129,10 @@ long HActuelledec() {
 void SignalVie() {
   Serial.println("Signal vie");
   if (gsm) {
-    MajHeure();
     modem.deleteSmsMessage(0,4);// au cas ou, efface tous les SMS envoyé/reçu
     NbrResetModem = 0; // reset compteur reset modem
   }
-
+  AIntru_HeureActuelle();
   if ((calendrier[month()][day()] ^ FlagCircule) && jour) { // jour circulé
     // 11 jour pour cas lancement de nuit pas d'allumage
     Sbidon = "Jour circule ou demande circulation";
@@ -2227,7 +2315,7 @@ void MajLog(String Id, String Raison) {
     Serial.println(Cbidon);
     appendFile(SPIFFS, filelog, Cbidon);
   }
-  else{ // fichier n'existe pas, création fichier avec première ligne date et Id
+  else { // fichier n'existe pas, création fichier avec première ligne date et Id
     char Cbidon[101]; // 100 char maxi
     sprintf(Cbidon, "%02d/%02d/%4d %02d:%02d:%02d;", day(), month(), year(), hour(), minute(), second());
     strcat(Cbidon,config.Idchar);
@@ -2455,6 +2543,11 @@ void ResetHard() {
   // GPIO13 to RS reset hard
   Serial.println("Reset Hard");
   delay(100);// imperatif
+  ESP.restart();
+
+  // Reset par PinReset, le reset se fait IO retombent
+  // mais ne redemarre plus depuis "derniere" version ESP32 >2?
+
   pinMode(PinReset, OUTPUT);
   digitalWrite(PinReset, LOW);
   // normalement on n'arrive jamais là
@@ -2476,7 +2569,7 @@ void OuvrirFichierCalibration() { // Lecture fichier calibration
 
   if (SPIFFS.exists(filecalibration)) {
     File f = SPIFFS.open(filecalibration, "r");
-    for (int i = 0; i < 3; i++) { //Read
+    for (int i = 0; i < (sizeof(CoeffTension) / sizeof(CoeffTension[0])); i++) { //Read
       String s = f.readStringUntil('\n');
       CoeffTension[i] = s.toFloat();
     }
@@ -2496,7 +2589,7 @@ void OuvrirFichierCalibration() { // Lecture fichier calibration
 }
 //---------------------------------------------------------------------------
 // Enregistrement fichier calibration en SPIFFS
-void Recordcalib() { // enregistrer fichier calibration en SPIFFS
+void Recordcalib() {
   // Serial.print(F("Coeff T Batterie = ")),Serial.println(CoeffTension1);
   // Serial.print(F("Coeff T Proc = "))	  ,Serial.println(CoeffTension2);
   // Serial.print(F("Coeff T VUSB = "))		,Serial.println(CoeffTension3);
@@ -2507,8 +2600,8 @@ void Recordcalib() { // enregistrer fichier calibration en SPIFFS
   f.close();
 }
 //---------------------------------------------------------------------------
+// convert heure decimale en hh:mm:ss
 String Hdectohhmm(long Hdec) {
-  // convert heure decimale en hh:mm:ss
   String hhmm;
   if (int(Hdec / 3600) < 10) hhmm = "0";
   hhmm += int(Hdec / 3600);
@@ -2668,7 +2761,6 @@ void action_wakeup_reason(byte wr) {
 //---------------------------------------------------------------------------
 // calcul durée de sleep
 void calculTimeSleep() {
-
   AIntru_HeureActuelle(); // determine si jour/nuit
 
   if (jour && (HActuelledec() + config.RepeatWakeUp) > config.FinJour) {
@@ -2747,7 +2839,6 @@ int get_wakeup_reason() {
   }
   Serial.flush();
 }
-
 //---------------------------------------------------------------------------
 // Efface SMS
 void EffaceSMS(int index) {
@@ -2784,7 +2875,6 @@ void print_uint64_t(uint64_t num) {
 //---------------------------------------------------------------------------
 //initialisation des tableaux
 void init_adc_mm(void) {
-  //initialisation des tableaux
   /* valeur par defaut facultative,
   	permet d'avoir une moyenne proche
   	du resulat plus rapidement
@@ -2820,7 +2910,7 @@ void read_adc(int pin1, int pin2, int pin3) {
   static int plus_ancien = 0;
   //acquisition
   int sample[3];
-  for (byte i = 0; i < 3; i++) {
+  for (byte i = 0; i < (sizeof(CoeffTension) / sizeof(CoeffTension[0])); i++) {
     if (i == 0)sample[i] = moyenneAnalogique(pin1);
     if (i == 1)sample[i] = moyenneAnalogique(pin2);
     if (i == 2)sample[i] = moyenneAnalogique(pin3);
@@ -2915,18 +3005,6 @@ void HomePage() {
   webpage += "</tr>";
 
   webpage += "<tr>";
-  webpage += "<td>Liste Restreinte</td>";
-  webpage += "<td>";
-  for (int i = 1; i < 10; i++) {
-    webpage += String(config.Pos_Pn_PB[i]);
-    if (i < 9) {
-      webpage += ",";
-    }
-  }
-  webpage += "</td>";
-  webpage += "</tr>";
-
-  webpage += "<tr>";
   webpage += "<td>GPRS APN</td>";
   webpage += "<td>";	webpage += String(config.apn);	webpage += "</td>";
   webpage += "</tr>";
@@ -2991,6 +3069,10 @@ void HomePage() {
   webpage += F("<td>");	webpage += String(config.sendTopic[1]);	webpage += F("</td>");
   webpage += F("</tr>");
 
+  webpage += F("<tr>");
+  webpage += F("<td>recv topic</td>");
+  webpage += F("<td>");	webpage += String(config.recvTopic[0]);	webpage += F("</td>");
+  webpage += F("</tr>");
 
   webpage += F("<tr>");
   webpage += F("<td>recv topic</td>");
@@ -3036,7 +3118,7 @@ void Tel_listPage() {
   webpage += "<th> Num&eacute;ro </th>";
   webpage += "<th> Liste restreinte </th>";
   webpage += "</tr>";
-  if (gsm) {
+
     File file = SPIFFS.open(filePhoneBook, "r");
     while (file.available()) {
       String ligne = file.readStringUntil('\n');
@@ -3049,7 +3131,6 @@ void Tel_listPage() {
       webpage += F("</tr>");
     }
     file.close();
-  }
 
   webpage += "</table><br>";
   append_page_footer();
@@ -3409,16 +3490,16 @@ bool FTP_upload_function (char *file2upload){
     // envoyer data
     delay(500);
     // pour test
-    int CoeffTension[4];          // Coeff calibration Tension
-    char filecalibration[11] = "/coeff.txt";    // fichier en SPIFFS contenant les data de calibration
-    if (SPIFFS.exists(filecalibration)) {
-      File f = SPIFFS.open(filecalibration, "r");
-      for (int i = 0; i < 4; i++) { //Read
-        String s = f.readStringUntil('\n');
-        CoeffTension[i] = s.toFloat();
-      }
-      f.close();
-    }
+    // int CoeffTension[4];          // Coeff calibration Tension
+    // char filecalibration[11] = "/coeff.txt";    // fichier en SPIFFS contenant les data de calibration
+    // if (SPIFFS.exists(filecalibration)) {
+    //   File f = SPIFFS.open(filecalibration, "r");
+    //   for (int i = 0; i < (sizeof(CoeffTension) / sizeof(CoeffTension[0])); i++) { //Read
+    //     String s = f.readStringUntil('\n');
+    //     CoeffTension[i] = s.toFloat();
+    //   }
+    //   f.close();
+    // }
     Serial.print(F("Coeff T Batterie = ")), Serial.print(CoeffTension[0]);
     Serial.print(F(" Coeff T Proc = "))	  , Serial.print(CoeffTension[1]);
     Serial.print(F(" Coeff T VUSB = "))		, Serial.print(CoeffTension[2]);
@@ -3470,8 +3551,6 @@ String sendAT(String ATcommand, String answer1, String answer2, unsigned int tim
       delay(10);
     }
   }
-  // Serial.print("reponse: "),Serial.println(content);
-  // Serial.println("fin reponse");
   return content;
 }
 //---------------------------------------------------------------------------
@@ -3696,6 +3775,38 @@ void readmodemtime(){
   N_H 		= modemHDtate.substring(i - 2, i).toInt();
   N_m 		= modemHDtate.substring(i + 1, j).toInt();
   N_S 		= modemHDtate.substring(j + 1, j + 3).toInt();
+  Serial.println(modemHDtate);
+}
+//---------------------------------------------------------------------------
+// Set systeme time to modem time
+void set_system_time(){
+  readmodemtime();
+  if(N_Y > 20 && N_Y!= 80){
+    // année > 2020 et n'est pas égale à 2080(date defaut modem si pas à l'heure)
+    setTime(N_H,N_m, N_S, N_D, N_M, N_Y);	    // mise à l'heure du systeme
+    Serial.println("MajHeure du systeme OK");
+    FlagSetTime = true;
+  } else {
+    // echec Synchro, force date 01/08/2022 08:00:00, jour toujours circulé
+    setTime(8,0, 0, 1, 8, 22);	    // mise à l'heure du systeme
+    // modem.send_AT("+CCLK=\"22/08/01,08:00:00+08\"");
+    Serial.println("MajHeure du systeme KO");
+    FlagSetTime = false;
+  }
+}
+//---------------------------------------------------------------------------
+// start true -> Start Alarmes
+// start false-> Stop Alarmes
+void StartStopAlarme(bool start){
+  if (start){
+    Alarm.enable(loopPrincipale);
+    Alarm.enable(DebutJour);
+    Alarm.enable(FinJour);
+  } else {
+    Alarm.disable(loopPrincipale);
+    Alarm.disable(DebutJour);
+    Alarm.disable(FinJour);
+  }
 }
 //---------------------------------------------------------------------------
 bool HeureEte() {
@@ -3954,6 +4065,136 @@ void copie_Topic(){
   strncpy(config.recvTopic[1],("S/Uout/"),sizeof(config.recvTopic[1]));
   strcat( config.recvTopic[1], &config.Idchar[5]); // S/Uout/CVxx
 }
+//---------------------------------------------------------------------------
+byte gprs_upload_function (){
+  // https://forum.arduino.cc/index.php?topic=376911.15
+  int buffer_space = 1000;
+  UploadFile = SPIFFS.open(filelog, "r");
+  byte reply = 1;
+  int i = 0;
+  // ne fonctionne pas dans tous les cas ex roaming
+  // while (i < 10 && reply == 1){ //Try 10 times...
+    // reply = sendATcommand("AT+CREG?","+CREG: 0,1","ERROR", 1000);
+    // i++;
+    // delay(1000);
+  // }
+  reply = 0;
+if (reply == 0){ // ouverture GPRS
+// reply = sendATcommand("AT+SAPBR=3,1,\"CONTYPE\",\"GPRS\"","OK","ERROR", 1000);
+if (reply == 0){
+// reply = sendATcommand("AT+SAPBR=3,1,\"APN\",\"sl2sfr\"", "OK", "ERROR", 1000);//Replace with your APN
+if (reply == 0){
+//reply = sendATcommand("AT+SAPBR=3,1,\"USER\",\"entelpcs\"", "OK", "ERROR", 1000);
+if (reply == 0){
+//reply = sendATcommand("AT+SAPBR=3,1,\"PWD\",\"entelpcs\"", "OK", "ERROR", 1000);
+if (reply == 0){
+reply = 2;
+i = 0;
+while (i < 3 && reply == 2){ //Try 3 times...
+  reply = sendATcommand("AT+SAPBR=1,1", "OK", "ERROR", 10000);
+  if (reply == 2){
+    sendATcommand("AT+SAPBR=0,1", "OK", "ERROR", 10000);
+  }
+  i++;
+}
+if (reply == 0){
+reply = sendATcommand("AT+SAPBR=2,1", "OK", "ERROR", 1000);
+if (reply == 0){
+reply = sendATcommand("AT+FTPCID=1", "OK", "ERROR", 1000);
+if (reply == 0){
+reply = sendATcommand("AT+FTPSERV=\"" + String(config.ftpServeur) + "\"", "OK", "ERROR", 1000);//replace ftp.sample.com with your server address
+if (reply == 0){
+reply = sendATcommand("AT+FTPPORT="+ String(config.ftpPort), "OK", "ERROR", 1000);
+if (reply == 0){
+reply = sendATcommand("AT+FTPUN=\"" + String(config.ftpUser) + "\"", "OK", "ERROR", 1000);//Replace 1234@sample.com with your username
+if (reply == 0){
+reply = sendATcommand("AT+FTPPW=\"" + String(config.ftpPass) + "\"", "OK", "ERROR", 1000);//Replace 12345 with your password
+if (reply == 0){
+reply = sendATcommand("AT+FTPPUTNAME=\"" + String(filelog) + "\"", "OK", "ERROR", 1000);
+if (reply == 0){
+  reply = sendATcommand("AT+FTPPUTPATH=\"/" + String(config.Idchar) + "/\"", "OK", "ERROR", 1000);// repertoire "/Id/"
+if (reply == 0){
+  unsigned int ptime = millis();
+  reply = sendATcommand("AT+FTPPUT=1", "+FTPPUT: 1,1", "+FTPPUT: 1,6", 60000);
+  Serial.println("Time: " + String(millis() - ptime));
+  if (reply == 0){
+    if (UploadFile) {
+      int i = 0;
+      unsigned int ptime = millis();
+      long archivosize = UploadFile.size();
+      while (UploadFile.available()) {
+        while(archivosize >= buffer_space){
+          reply = sendATcommand("AT+FTPPUT=2," + String(buffer_space), "+FTPPUT: 2,1", "OK", 3000);
+            if (reply == 0) { //This loop checks for positive reply to upload bytes and in case or error it retries to upload
+              Serial.println("Remaining Characters: " + String(UploadFile.available()));
+              for(int d = 0; d < buffer_space; d++){
+                Serial2.write(UploadFile.read());
+                archivosize -= 1;
+              }
+            }
+            else {
+              Serial.println("Error while sending data:");
+              reply = 1;
+            }
+        }
+        if (sendATcommand("AT+FTPPUT=2," + String(archivosize), "+FTPPUT: 2," + String(archivosize), "ERROR", 10000) == 0) {
+          for(int t = 0; t < archivosize; t++){
+            Serial2.write(UploadFile.read());
+          }
+        }
+      }
+    UploadFile.close();
+    Serial.println("Time: " + String(millis() - ptime));
+    }
+  }
+}
+}
+}
+}
+}
+}
+}
+}
+}
+}
+}
+}
+}
+}
+  sendATcommand("AT+SAPBR=0,1", "OK", "ERROR", 10000); // fermeture GPRS
+return reply;
+}
+//---------------------------------------------------------------------------
+byte sendATcommand(String ATcommand, String answer1, String answer2, unsigned int timeout){
+  byte reply = 1;
+  String content = "";
+  char character;
+
+  //Clean the modem input buffer
+  while(Serial2.available()>0) Serial2.read();
+
+  //Send the atcommand to the modem
+  Serial2.println(ATcommand);
+  delay(100);
+  unsigned int timeprevious = millis();
+  while((reply == 1) && ((millis() - timeprevious) < timeout)){
+    while(Serial2.available()>0) {
+      character = Serial2.read();
+      content.concat(character);
+      Serial.print(character);
+      delay(10);
+    }
+    //Stop reading conditions
+    if (content.indexOf(answer1) != -1){
+      reply = 0;
+    }else if(content.indexOf(answer2) != -1){
+      reply = 2;
+    }else{
+      //Nothing to do...
+    }
+  }
+  return reply;
+}
 /* --------------------  test local serial seulement ----------------------*/
 void recvOneChar() {
 
@@ -3974,6 +4215,7 @@ void recvOneChar() {
   if (newData == true) {
     Serial.println(serialmessage);
     Rmessage = serialmessage;
+    Serial.flush();
     traite_sms("Local");//	traitement en mode local
     newData = false;
     serialmessage = "";
