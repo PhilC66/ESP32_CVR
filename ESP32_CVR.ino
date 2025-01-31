@@ -4,7 +4,7 @@
 
   todo
   
-  V4-00 27/01/2025 Version LTE-M
+  V4-00 30/01/2025 Version LTE-M
   1- passage LTE-M
   2- Ajouter prise en compte cde DCVR1 -> OCVR1
   3- Ajouter commande avec/sans Allumage feu rouge si fermé
@@ -1195,8 +1195,8 @@ fin_tel:
     if (ok && firstdecision) {
       // Seulement si déjà lancé apres première décision
       // sinon au lancement, on attend première décision
-      // Extinction();
-      action_wakeup_reason(4);
+      // action_wakeup_reason(4);
+      FinJournee(); // si fermé, ouverture avant sleep
     }
   }
   else if (Rmessage.indexOf("TEMPOWAKEUP") == 0) { // Tempo wake up
