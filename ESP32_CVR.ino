@@ -9,7 +9,7 @@
   2- Ajouter prise en compte cde DCVR1 -> OCVR1
   3- Ajouter commande avec/sans Allumage feu rouge si fermé
   Compilation LOLIN D32,default,80MHz, IMPORTANT ESP32 2.0.17
-  Arduino IDE 1.8.19 : 1097169 83%, 56080 17% sur PC IDE VSCODE
+  Arduino IDE 1.8.19 : 1097185 83%, 56080 17% sur PC IDE VSCODE
   Arduino IDE 1.8.19 : x 77%, x 14% sur raspi (sans ULP)
 
   V1-3 22/03/2024 installé CVR1
@@ -563,7 +563,8 @@ void Acquisition() {
     if (FlagFinJournee) { // arret auto demandé fin de journée
       generationMessage();
       Serial.println("message serveur");
-      envoieGroupeMessage(false,true); // envoie serveur
+      envoieGroupeMessage(false,true);  // envoie serveur
+      envoieGroupeMessage(false,false); // envoie user
       FlagFinJournee = false;
       FinJournee();
     }
