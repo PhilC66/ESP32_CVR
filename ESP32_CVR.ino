@@ -4,12 +4,12 @@
 
   todo
   
-  V4-00 30/01/2025 Version LTE-M
+  V4-00 Version LTE-M Installé 04/02/2025
   1- passage LTE-M
   2- Ajouter prise en compte cde DCVR1 -> OCVR1
   3- Ajouter commande avec/sans Allumage feu rouge si fermé
   Compilation LOLIN D32,default,80MHz, IMPORTANT ESP32 2.0.17
-  Arduino IDE 1.8.19 : 1097185 83%, 56080 17% sur PC IDE VSCODE
+  Arduino IDE 1.8.19 : 1097201 83%, 56080 17% sur PC IDE VSCODE
   Arduino IDE 1.8.19 : x 77%, x 14% sur raspi (sans ULP)
 
   V1-3 22/03/2024 installé CVR1
@@ -591,9 +591,6 @@ void Acquisition() {
   // Serial.print(F(" Freemem = ")), Serial.println(ESP.getFreeHeap());
   static byte nalaTension = 0;
   static byte nRetourTension = 0;
-  TensionBatterie = map(adc_mm[0] / nSample, 0, 4095, 0, CoeffTension[0]);
-  VBatterieProc   = map(adc_mm[1] / nSample, 0, 4095, 0, CoeffTension[1]);
-  VUSB            = map(adc_mm[2] / nSample, 0, 4095, 0, CoeffTension[2]);
 
   int etatbatt = 0;
   if (config.TypeBatt == 16) etatbatt = BattPBpct(TensionBatterie, 6);
@@ -2903,6 +2900,11 @@ void init_adc_mm(void) {
 // lecture des adc
 void adc_read() {
   read_adc(PinBattSol, PinBattProc, PinBattUSB); // lecture des adc
+  
+  TensionBatterie = map(adc_mm[0] / nSample, 0, 4095, 0, CoeffTension[0]);
+  VBatterieProc   = map(adc_mm[1] / nSample, 0, 4095, 0, CoeffTension[1]);
+  VUSB            = map(adc_mm[2] / nSample, 0, 4095, 0, CoeffTension[2]);
+
 }
 //---------------------------------------------------------------------------
 // lecture adc
