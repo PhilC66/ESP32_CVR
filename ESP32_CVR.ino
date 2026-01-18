@@ -4,6 +4,14 @@
 
   todo
   
+
+  V4-01 
+  1- Application gestion réseau idem PN avec Blacklist opérateur
+  2- Ajout commande externe sur entrée 25 pour forcer ouverture/fermeture CVR
+      - Une impulsion de 2s sur l'entrée 25 force le changement de position du CVR
+  3- Gestion BLE idem tracker
+
+  
   V4-00 Version LTE-M Installé 04/02/2025
   1- passage LTE-M
   2- Ajouter prise en compte cde DCVR1 -> OCVR1
@@ -62,8 +70,8 @@
 
 */
 #include <Arduino.h>
-String ver        = "V4-00";
-int    Magique    = 4;
+String ver        = "V4-01";  // version du soft
+int    Magique    = 5;        // numéro magique fichier config
 
 #define TINY_GSM_MODEM_SIM7000
 #define Exploitation           // selection des données serveur dans fichier credentials
@@ -111,6 +119,7 @@ bool    SPIFFS_present = false;
 #define TX_PIN        16   // RX Sim7000
 #define PinReset      13   // Reset Hard
 #define PinTest       27   // Test sans GSM cc a la masse
+#define PinIp3        25   // Entrée commande externe CVR
 
 #define NTPServer "pool.ntp.org"
 
@@ -201,8 +210,8 @@ struct  config_t           // Structure configuration sauvée en SPIFFS
   int     timeoutWifi;     // tempo coupure Wifi si pas de mise a jour (s)
   int     SlowBlinker;     // ms
   int     FRgePWM;         // Modulation Feux Rouge %
-  int     Tempoouverture;  // Tempo ouverture verin
-  int     Tempofermeture;  // Tempo fermeture verin
+  int     Tempoouverture;  // Tempo ouverture verin en s
+  int     Tempofermeture;  // Tempo fermeture verin en s
   char    Idchar[11];      // Id
   char    apn[11];         // APN
   char    gprsUser[11];    // user for APN
@@ -222,6 +231,8 @@ struct  config_t           // Structure configuration sauvée en SPIFFS
   int     hhiver;          // decalage Heure hiver UTC
   bool    sendSMS;         // Autorisation envoyer SMS
   bool    autoupload;      // Upload automatique du fichier log
+  bool    BPlocal;         // Prise en compte BP externe CVR sur PinIp3
+  int     TempoBPexterne;  // Tempo prise en compte BP externe CVR en s
   uint16_t keepAlive;      // Paramètre keep alive de Pubsubclient
   byte    cptAla;          // Compteur alarmes avant declenchement
 } ;
@@ -266,6 +277,7 @@ void setup() {
 
   pinMode(PinIp1     , INPUT_PULLUP);
   pinMode(PinIp2     , INPUT_PULLUP);
+  pinMode(PinIp3     , INPUT_PULLUP);
   pinMode(PinFerme   , OUTPUT);
   pinMode(PinOuvre   , OUTPUT);
   pinMode(PinFeuxR   , OUTPUT);
@@ -326,6 +338,8 @@ void setup() {
     config.hete          = 2; // heure
     config.hhiver        = 1; // heure
     config.sendSMS       = false; // pas d'envoie de SMS
+    config.BPlocal       = true;  // prise en compte commande externe CVR
+    config.TempoBPexterne= 3;     // tempo prise en compte BP externe CVR
     config.keepAlive     = 300; // 5mn, IMPERATIF pour réduire conso data
     config.autoupload    = false;
     config.cptAla        = 10; // 11*Acquisition time
@@ -467,6 +481,8 @@ void loop() {
   }
 
   recvOneChar(); // Capture reception liaison serie locale
+  // Surveillance non bloquante de l'entree externe PinIp3 : impulsion >2s déclenche Cde_change_etat_CVR()
+  if(config.BPlocal) Monitor_Ip3();
 
   if(Online){
     mqttClient.loop(); // Call the loop to maintain connection to the server.
@@ -475,6 +491,26 @@ void loop() {
   ArduinoOTA.handle();
   Alarm.delay(0);
 }	//fin loop
+//---------------------------------------------------------------------------
+// Surveillance non bloquante de l'entree PinIp3 (entrée externe CVR)
+void Monitor_Ip3(){
+  static unsigned long lowSince = 0;
+  static bool wasLow = false;
+  if (digitalRead(PinIp3) == 0) {
+    if (!wasLow){
+      wasLow = true;
+      lowSince = millis();
+    } else {
+      if (millis() - lowSince >= config.TempoBPexterne * 1000) {
+        // empêche retrigger tant que l'entrée reste basse
+        wasLow = false;
+        Cde_change_etat_CVR(); // lancer la commande
+      }
+    }
+  } else {
+    wasLow = false;
+  }
+}
 //---------------------------------------------------------------------------
 void Acquisition() {
 
@@ -1918,7 +1954,40 @@ fin_tel:
     sendReply(Origine);
     if (FlagDemandeAllume) Acquisition(); // Allumage au passage dans Acquisition
   }
-  //**************************************
+  else if (Rmessage.indexOf(F("BPLOCAL")) == 0){
+    // Activation/Désactivation bouton poussoir local
+    if (Rmessage.indexOf(char(61)) == 7) {
+      int i = Rmessage.substring(8).toInt();
+      if (i == 0){
+        config.BPlocal = 0;
+      } else if (i == 1){
+        config.BPlocal = 1;
+      }
+      sauvConfig();													// sauvegarde config
+      Sbidon = F("BP Local=");
+      Sbidon += String(config.BPlocal);
+      MajLog(Origine, Sbidon);// renseigne log
+    }
+    message += "BP Local : ";
+    message += String(config.BPlocal);
+    sendReply(Origine);
+  }
+  else if (Rmessage.indexOf(F("TEMPOBP")) == 0){
+    // Tempo BP externe
+    if (Rmessage.indexOf(char(61)) == 7) {
+      int i = Rmessage.substring(8).toInt();
+      if (i > 0 && i <= 100) {
+        config.TempoBPexterne = i;
+        sauvConfig();													// sauvegarde config
+        Sbidon = F("TEMPO BP externe=");
+        Sbidon += String(config.TempoBPexterne);
+        MajLog(Origine, Sbidon);// renseigne log
+      }
+    }
+    message += "TEMPO BP externe (s) : ";
+    message += String(config.TempoBPexterne);
+    sendReply(Origine);
+  }
   else {
     message += "Commande non reconnu !";		//"Commande non reconnue ?"
     sendReply(Origine);
@@ -2445,6 +2514,8 @@ void PrintConfig() {
   Serial.print(F("recvTopic = "))               , Serial.println(config.recvTopic[0]);
   Serial.print(F("recvTopic = "))               , Serial.println(config.recvTopic[1]);
   Serial.print(F("Send SMS autorisation = "))   , Serial.println(config.sendSMS);
+  Serial.print(F("BP local actif = "))          , Serial.println(config.BPlocal);
+  Serial.print(F("Tempo BP externe (s) = "))    , Serial.println(config.TempoBPexterne);
   Serial.print(F("declage Heure ete = "))       , Serial.println(config.hete);
   Serial.print(F("declage Heure hiver = "))     , Serial.println(config.hhiver);
   Serial.print(F("autoupload = "))              , Serial.println(config.autoupload);
@@ -3000,6 +3071,21 @@ void HomePage() {
   webpage += "<tr>";
   webpage += "<td>Tempo r&eacute;p&eacute;tition Wake up Jour Circul&eacute; (s)</td>";
   webpage += "<td>";	webpage += String(config.RepeatWakeUp);	webpage += "</td>";
+  webpage += "</tr>";
+
+  webpage += "<tr>";
+  webpage += "<td>Autorisation envoie SMS : </td>";
+  webpage += "<td>";	webpage += String(config.sendSMS);	webpage += "</td>";
+  webpage += "</tr>";
+
+  webpage += "<tr>";
+  webpage += "<td>BP local Actif : </td>";
+  webpage += "<td>";	webpage += String(config.BPlocal);	webpage += "</td>";
+  webpage += "</tr>";
+
+  webpage += "<tr>";
+  webpage += "<td>Tempo BP local (s) : </td>";
+  webpage += "<td>";	webpage += String(config.TempoBPexterne);	webpage += "</td>";
   webpage += "</tr>";
 
   webpage += "<tr>";
@@ -4197,6 +4283,32 @@ byte sendATcommand(String ATcommand, String answer1, String answer2, unsigned in
     }
   }
   return reply;
+}
+//---------------------------------------------------------------------------
+// changement etat CVR par cde externe
+void Cde_change_etat_CVR(){
+  if(FlagDemande_CVR == true){
+    // une demande de changement d'etat CVR est en cours
+    return;
+  }
+  Serial.printf("Cde externe changement etat CVR de %d vers %d\n", Cvr, Cvr);
+  if(Cvr == 1){ // fermé -> ouvrir
+    // demande Ouverture
+    Memo_Demande_CVR[0] = "Local"; // nom demandeur
+    Memo_Demande_CVR[1] = "BP";    // num demandeur
+    Memo_Demande_CVR[2] = "O";     // demande d'origine
+    FlagDemande_CVR = true;
+    MajLog("Local", "demande : BP Local");
+    Ouvrir_CVR();
+  } else if (Cvr == 2){ // ouvert -> fermer
+    // demande Fermeture
+    Memo_Demande_CVR[0] = "Local"; // nom demandeur
+    Memo_Demande_CVR[1] = "BP";    // num demandeur
+    Memo_Demande_CVR[2] = "F";     // demande d'origine
+    FlagDemande_CVR = true;
+    MajLog("Local", "demande : BP Local");
+    Fermer_CVR();
+  }
 }
 /* --------------------  test local serial seulement ----------------------*/
 void recvOneChar() {
