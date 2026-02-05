@@ -5,12 +5,17 @@
   todo
   
 
-  V4-01 
+  V4-01 30/01/2026
   1- Application gestion réseau idem PN avec Blacklist opérateur
   2- Ajout commande externe sur entrée 25 pour forcer ouverture/fermeture CVR
-      - Une impulsion de 2s sur l'entrée 25 force le changement de position du CVR
-  3- Gestion BLE idem tracker
-
+      - Une pression de 3s sur l'entrée 25 force le changement de position du CVR
+  3- Ajout UPLOADCOEFF et UPLOADLOG via HTTP
+    - uploadcoeff : envoi fichier calibration coeff.txt
+    - uploadlog : envoi fichier log.txt
+  
+  Compilation LOLIN D32,Minimal SPIFFS(Large APPS with OTA),80MHz, IMPORTANT ESP32 2.0.17
+  Arduino IDE 1.8.19 : 1115713 56%, 56484 17% sur PC IDE VSCODE
+  Arduino IDE 1.8.19 : x 77%, x 14% sur raspi (sans ULP)
   
   V4-00 Version LTE-M Installé 04/02/2025
   1- passage LTE-M
@@ -122,12 +127,27 @@ bool    SPIFFS_present = false;
 #define PinIp3        25   // Entrée commande externe CVR
 
 #define NTPServer "pool.ntp.org"
+// Hystérésis & backoff anti-flapping
+#define BL_HITS_BEFORE_MIGRATE   1  // # de constats consécutifs de PLMN blacklist avant migration
+#define NET_FAILS_BEFORE_RESET   12  // # de checks consécutifs PDP/MQTT down avant reset modem
+
 
 #define uS_TO_S_FACTOR 1000000          //* Conversion factor for micro seconds to seconds */
 #define FORMAT_SPIFFS_IF_FAILED true    // format LittelFS si lecture impossible
 #define nSample (1<<4)                  // nSample est une puissance de 2, ici 16 (4bits)
 unsigned int adc_hist[5][nSample];      // tableau stockage mesure adc, 0 Batt, 1 Proc, 2 USB, 3 24V, 5 Lum
 unsigned int adc_mm[5];                 // stockage pour la moyenne mobile
+
+// Variables pour upload HTTP
+// Base64 (pour fabriquer l'entête Basic Auth)
+static const char PROGMEM b64tab[] =
+  "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+const uint16_t HTTP_PORT = 80;              // port HTTP
+const char* HTTP_PATH = "/tpcfupload.php";  // endpoint côté serveur
+const char* MIME_TYPE   = "text/plain";     // ex: "application/octet-stream"
+// BASIC AUTH (identiques à ceux du upload.php côté serveur)
+const char* BASIC_USER = "iot";
+const char* BASIC_PASS = "secret";
 
 uint64_t TIME_TO_SLEEP  = 15;/* Time ESP32 will go to sleep (in seconds) */
 unsigned long debut     = 0; // pour decompteur temps wifi
@@ -138,6 +158,7 @@ char filecalibration[11] = "/coeff.txt";    // fichier en SPIFFS contenant les d
 char filelog[9]          = "/log.txt";      // fichier en SPIFFS contenant le log
 char filePhoneBook[8]    = "/pb.txt";       // fichier contenant liste N°tel autorisé
 char PB_list[10][30];                       // PB liste en ram
+char fileBlacklist[12]   = "/blPLMN.txt";   // Blacklist PLMN
 
 const String soft = "ESP32_CVR.ino.d32"; // nom du soft
 const String Mois[13] = {"", "Janvier", "Fevrier", "Mars", "Avril", "Mai", "Juin", "Juillet", "Aout", "Septembre", "Octobre", "Novembre", "Decembre"};
@@ -195,10 +216,21 @@ TinyGsm        modem(debugger);
 #else
 TinyGsm        modem(SerialAT);
 #endif
-TinyGsmClient client(modem);
-PubSubClient  mqttClient(client);
+
+// Socket 0 réservé au MQTT, socket 1 pour HTTP
+TinyGsmClient  mqttSock(modem, 0);
+TinyGsmClient  httpSock(modem, 1);   // TCP clair  sur socket 1
+PubSubClient   mqttClient(mqttSock); // MQTT client sur socket 0
 WebServer server(80);
 File UploadFile;
+
+// ===== BLACKLIST PLMN =====
+// Capacité max (modifiable)
+#define BL_MAX 16
+
+// Tableau modifiable au runtime
+char BLACKLIST[BL_MAX][8];   // taille 8 = "20801\0" (6 ok) + marge
+uint8_t BL_COUNT = 0;
 
 struct  config_t           // Structure configuration sauvée en SPIFFS
 {
@@ -241,7 +273,8 @@ config_t config;
 char willTopic[7];
 
 int N_Y, N_M, N_D, N_H, N_m, N_S; // variable Date/Time temporaire
-int NbrResetModem = 0;            // Nombre de fois reset modem, remise à 0 signal vie
+int NbrResetModem  = 0;           // Nombre de fois reset modem, remise à 0 signal vie
+int cptonBlacklist = 0;           // Nombre de detection Blacklist, remise à 0 signal vie
 int Histo_Reseau[5]={0,0,0,0,0};  // Historique Reseau cumul chaque mise à l'heure
 
 Ticker SlowBlink;          // Clignotant lent
@@ -254,9 +287,14 @@ AlarmId Aouverture;        // Tempo ouverture verin
 AlarmId Afermeture;        // Tempo fermeture verin
 
 //---------------------------------------------------------------------------
-// newtime = "" mise à l'heure NTP
-// newtime = "YY/MM/DD,hh:mm:ss" mise à l'heure reçue
 bool MajHeure(String newtime = "");
+void purgeUART(uint32_t timeoutMs);
+bool ensureModemReady(uint32_t budget_ms);
+bool sawUrcActivityDuring(uint32_t ms);
+bool isPdpUp(uint8_t cid);
+bool coldAttach(uint8_t tries);
+bool waitAttach(uint32_t timeoutMs);
+bool HTTP_Upload_File(char* REMOTE_NAME, char filelog);
 //---------------------------------------------------------------------------
 void setup() {
   message.reserve(300); // texte des reponses
@@ -282,6 +320,8 @@ void setup() {
   pinMode(PinOuvre   , OUTPUT);
   pinMode(PinFeuxR   , OUTPUT);
   pinMode(PinTest    , INPUT_PULLUP);
+  pinMode(LED_PIN    , OUTPUT);
+  digitalWrite(LED_PIN , LOW);
   adcAttachPin(PinBattProc);
   adcAttachPin(PinBattSol);
   adcAttachPin(PinBattUSB);
@@ -297,15 +337,6 @@ void setup() {
 
   if (gsm) {
     SerialAT.begin(115200, SERIAL_8N1, RX_PIN, TX_PIN);
-    modem_on();
-    Serial.print(F("Reset modem: "));
-    Serial.println(modem.setPhoneFunctionality(1,1));// CFUN=1,1 full functionality, reset online mode
-    delay(200);
-    Serial.print(F("Modem Info: "));
-    Serial.println(modem.getModemInfo());
-    modem.setNetworkMode(38);  // Network Mode LTE
-    modem.setPreferredMode(1); // Mode CAT-M
-    modem.disableGPS();        // Arret GPS
   }
   // parametrage PWM pour le feu Rouge
   // https://randomnerdtutorials.com/esp32-pwm-arduino-ide/
@@ -319,7 +350,7 @@ void setup() {
   readConfig(); // Lecture de la config
   if (config.magic != Magique) {
     /* verification numero magique si different
-    		erreur lecture SPIFFS ou carte vierge
+    	  erreur lecture SPIFFS ou carte vierge
     		on charge les valeurs par défaut
     */
     Serial.println("Nouvelle Configuration !");
@@ -406,42 +437,97 @@ void setup() {
   OuvrirCalendrier();					// ouvre calendrier circulation en SPIFFS
   OuvrirFichierCalibration(); // ouvre fichier calibration en SPIFFS
   Ouvrir_PB();                // ouvre le fichier Phone book
+  Ouvrir_BL();                // ouvrir fichier Blacklist PLMN
+
   if (gsm) {
-    Serial.print(("Waiting for network..."));
-    if (!modem.waitForNetwork()) {
-      Serial.println(F(" fail"));
-      delay(100);
-      // return;
-    } else {
-      Serial.println(F(" success"));
-    }
-    if (modem.isNetworkConnected()) {
-      Serial.println("Network connected");
-
-      // Demande Operateur connecté
-      Serial.print(F("Operateur :")), Serial.println(modem.getOperator());
-
-      ConnectGPRS();
-
-      if (modem.isGprsConnected()) { Serial.println(F("GPRS connected")); }
-      IPAddress local = modem.localIP();
-      Serial.println("Local IP:" + local.toString());
-
-      Serial.print("Signal quality:"), Serial.println(read_RSSI());
-    }
-    
     mqttClient.setBufferSize(384);
     mqttClient.setKeepAlive(config.keepAlive);                // Set Pubsub keep alive interval
     mqttClient.setServer(config.mqttServer, config.mqttPort); // Set the MQTT broker details.
     mqttClient.setCallback(mqttSubscriptionCallback);         // Set the MQTT message handler function.
 
+    // --- Test communication ---
+    Serial.println("Testing Modem Response...");
+    // On tente de parler AT directement
+    if (!ensureModemReady(12000)) {
+      Serial.println("[WARN] No AT yet (setup) -> soft reset CFUN=1,1");
+      
+      if (!SoftResetModem()) {
+        Serial.println("[ERR] Modem still silent after soft reset -> continue init anyway");
+        // pas de power-cycle matériel ici; la health gèrera plus tard si besoin
+        // ou HardResetModem();??
+      }
+    }
+    // Petit drain après ces phases
+    purgeUART(500);
+    // --- Info modem ---
+    Serial.print("Modem Info: ");
+    Serial.println(modem.getModemInfo());
+
+    // Pendant l’init: pas d’URC d’enregistrement
+    modem.sendAT("+CREG=0");  modem.waitResponse(300);
+    modem.sendAT("+CEREG=0"); modem.waitResponse(300);
+
+    // Hygiène de base + format opérateur numérique
+    setLTE_M_only();
+    modem.sendAT("+CNMI=2,0,0,0,0"); modem.waitResponse(300);
+    // modem.sendAT("+CEREG=2"); modem.waitResponse(300); // apres init
+    ensureCopsNumeric();
+    modem.sendAT(String("+CGDCONT=1,\"IP\",\"") + config.apn + "\""); modem.waitResponse(800);
+
+    // --- Test Warm Resume ---
+    // Warm resume d’abord (rapide) ; sinon cold attach rapide
+    purgeUART(300);
+    if (tryWarmResume()) {
+      Serial.println("[BOOT] Warm resume OK");
+    } else {
+      Serial.println("[BOOT] Warm resume fail -> cold attach fast");
+      purgeUART(300);
+      if (!coldAttach(2)) Serial.println("[NET] Cold attach failed");
+    }
+    //+++ re-verrouiller profil si le module a reset entre-temps
+    relockRadioIfNeeded();
+
+    String plmn = getPLMN();
+    if (isBlacklisted(plmn)) {
+      Serial.print("[NET] Blacklisted PLMN detected: "); Serial.println(plmn);
+      ReattachModem();
+      delay(5000);
+      waitAttach(120000);
+    }
+    modem.sendAT("+CEREG=2"); modem.waitResponse(300);
+
+    // --- Vérif PDP ---
+    bool PDPok = isPdpUp(1);
+    if (!PDPok) {
+      Serial.println("[NET] PDP not ready → quick recover");
+      modem.gprsDisconnect();          // inoffensif si déjà down
+      delay(600);
+      ConnectGPRS();
+      PDPok = isPdpUp(1);          // re-test
+    }
+
+    if (PDPok) {
+      Serial.println("[NET] PDP context is UP");
+      mqttConnect();
+    } else {
+      Serial.println("[NET] PDP still down → skip MQTT for now");
+    }
+
+    Serial.print("[CHECK]CAT-M CMNB=1 :"),Serial.println(String(modem.send_AT(F("+CMNB?"))));
+    Serial.print("[CHECK]LTE only CNMP=38:"),Serial.println(String(modem.send_AT(F("+CNMP?"))));
+    
+    modem.disableGPS();        // Arret GPS
+
+    IPAddress local = modem.localIP();
+    Serial.println("Local IP:" + local.toString());
+
+    Serial.print("Signal quality:"), Serial.println(read_RSSI());
+
     // Synchro heure
     readmodemtime();           // Lecture heure modem
     // set modem Localtime
-    Serial.println("set CLTS=1:"),Serial.println(modem.send_AT("+CLTS=1"));
+    Serial.print("set CLTS=1"),Serial.println(modem.send_AT("+CLTS=1"));
     timesstatus();								// Etat synchronisation Heure Sys
-    // sync Heure system avec modem (si Heure modem valide)
-    // place FlagSetTime=true si Ok, sinon relancer dans la boucle
     set_system_time();
     timesstatus();								// Etat synchronisation Heure Sys
     Serial.print("Syst Time ="),Serial.println(displayTime(0));
@@ -544,6 +630,7 @@ void Acquisition() {
       Serial.println("O");
       break;
   }
+
   Serial.print("Demande en attente:"), Serial.println(FlagDemande_CVR);
   static byte lastminute = minute();
   if(minute() == 0 && minute()!=lastminute){
@@ -721,20 +808,50 @@ void Acquisition() {
 }
 //---------------------------------------------------------------------------
 // check if we are Oline
-void Check_Online(){  
-  static int cptRegStatusFault = 0; // compteur defaut network
+void Check_Online(){
+  // Serial.println("[HEALTH] Check_Online start");
+  
   bool net_status  = false;
+  bool ope_status  = false;
   bool gprs_status = false;
   bool mqtt_status = false;
+  bool onBlacklist = false;
+  static byte cptRegStatusFault = 0; // compteur defaut network
+  static byte onBlacklistCpt = 0; // Compteur On Blacklsit
+  static byte gprsCpt        = 0; // Compteur gprs Status fault
+  static byte mqttCpt        = 0; // Compteur mqtt Status fault
+  byte onBlacklistMax = 2;
+  String plmn = "";
 
-  net_status = modem.isNetworkConnected();
-  if (net_status){
+  // Vérification et correction CNMP et CMNB
+  relockRadioIfNeeded(); // 7ms
+
+  net_status = Check_Network(); // Cnx réseau OK
+
+  // lecture Opérateur
+  plmn = getPLMN();
+  if (plmn.length() == 0) { delay(300); plmn = getPLMN(); }
+  if(isBlacklisted(plmn)){
+    onBlacklist = true;
+    onBlacklistCpt ++;
+  } else {
+    ope_status = true;
+    onBlacklistCpt = 0;
+  }
+
+  if(ope_status && !net_status){
+    net_status = Check_Network(); // Cnx réseau OK
+  }
+
+  if (ope_status){
     if (modem.isGprsConnected()){
       gprs_status = true;
+      gprsCpt = 0;
     } else {
       if (ConnectGPRS()){
         gprs_status = true;
-      }
+        gprsCpt = 0;
+      } else { gprsCpt ++;}
     }
   }
   if (net_status && gprs_status){
@@ -743,10 +860,12 @@ void Check_Online(){
         if (mqttSubscribe(0) == true) {
           Serial.println("Subscribed");
           mqtt_status = true;
-        }
+          mqttCpt = 0;
+        } else {mqttCpt ++;}
       }
     } else { // si mqqt connecté, suppose subscribe ok
       mqtt_status = true;
+      mqttCpt = 0;
     }
   }
 
@@ -755,31 +874,74 @@ void Check_Online(){
   } else {
     Online = false;
   }
-
-  Sbidon = displayTime(0) + fl;
-  Sbidon += "Online,res,gprs,mqtt,nRegFault :" + String(Online) + ":" + String(net_status) + ":" + String(gprs_status);
-  Sbidon += ":" + String(mqtt_status) + ":" + String(cptRegStatusFault) + fl;
+  
+  String Sbidon = "[HEALTH]";
+  Sbidon += displayTime(0);
+  Sbidon += ", Online=" + String(Online)
+  + "| res=" + String(net_status)   + ":" + String(cptRegStatusFault)
+  + "| ope=" + String(!onBlacklist) + ":" + String(onBlacklistCpt)
+  + "| gprs=" + String(gprs_status)  + ":" + String(gprsCpt)
+  + "| mqtt=" + String(mqtt_status)  + ":" + String(mqttCpt) + fl;
   Serial.print(Sbidon);
+
   if(net_status){
     Serial.print(modem.getOperator());
     IPAddress local = modem.localIP();
     Serial.println("; IP:" + local.toString());
   }
 
-  // Patch Blocage modem
+  // Patch Blocage modem (OK tester en forçant net_status=true)
   if(! net_status){
-    if(cptRegStatusFault ++ > 24){ // si hors réseau > 24*5s=120s
-      cptRegStatusFault = 0;
-      NbrResetModem +=1;
+    if(cptRegStatusFault ++ > NET_FAILS_BEFORE_RESET){ // si hors réseau > 12*10s=120s
       Sbidon = "Reset modem suite Reg status fault" + String(cptRegStatusFault);
+      cptRegStatusFault = 0;
+      NbrResetModem +=1;      
       Serial.println(Sbidon);
-      if(modem.setPhoneFunctionality(1,1)){// CFUN=1,1 full functionality, reset online mode
-        modem.setNetworkMode(38);  // Network Mode LTE
-        modem.setPreferredMode(1); // Mode CAT-M
+      if(SoftResetModem()){// CFUN=1,1 full functionality, reset online mode
+        setLTE_M_only();
+        ensureCopsNumeric();
+        modem.sendAT(String("+CGDCONT=1,\"IP\",\"") + config.apn + "\""); modem.waitResponse(800);
       }
     }
   } else {
     cptRegStatusFault = 0;// reset compteur
+  }
+
+  // Migration hors Blacklist (avec hystérésis)
+  // Politique: on migre si PLMN blacklisté pendant BL_HITS_BEFORE_MIGRATE cycles consécutifs
+  // et si (MQTT est OK pour éviter perte) OU si le PDP est stable (au choix).
+  if (onBlacklist && onBlacklistCpt >= onBlacklistMax) {
+    cptonBlacklist ++; // Incremente le compteur Blacklist
+    Serial.print("[HEALTH] PLMN blacklisted persistently -> migrate from "); Serial.println(plmn);
+    // Dérégistration puis auto attach
+    ReattachModem();
+    delay(5000);
+    Serial.println("[HEALTH] Start tentative reattach.");
+    if (waitAttach(120000)) {
+      Serial.println("[HEALTH] reattach.");
+      // PDP/GPRS puis MQTT
+      ConnectGPRS();
+      if(!modem.isGprsConnected()){
+        Serial.println("[HEALTH] Gprs not connected.");
+        ConnectGPRS();
+      }
+      if (!mqttClient.connected()) {
+        if(mqttConnect()) {
+          Serial.println("[HEALTH] MQTT reconnected.");
+          Online = true;
+          onBlacklistCpt = 0;
+        } else {
+          Serial.println("[WARN] MQTT reconnect failed.");
+          Online = false;
+        }
+      }
+    } else {
+      Serial.println("[WARN] migrate attach failed.");
+      Online = false;
+      if(onBlacklistCpt > onBlacklistMax + 3){
+        // on fait quoi ???????????????
+      }
+    }
   }
 }
 //---------------------------------------------------------------------------
@@ -962,8 +1124,11 @@ fin_tel:
   }
   else if (Rmessage.indexOf("SYS") > -1) {
     if (gsm) {
+      modem.sendAT("+COPS=3,1");         // 3 = format, 1 = alpha short
+      modem.waitResponse(500);
       message += modem.getOperator(); // Operateur
       message += fl;
+      ensureCopsNumeric();
       byte n = modem.getRegistrationStatus();        
       if (n == 5) {
         message += F(("rmg, "));// roaming 1.0s
@@ -1487,23 +1652,16 @@ fin_tel:
     }
   }
   else if (gsm && Rmessage.indexOf(F("UPLOADLOG")) == 0) {//upload log sur demande
-    message += "Fonction non active";
-    // message += F("lancement upload log");
-    // message += fl;
-    // MajLog(Origine, "upload log");// renseigne log
-    // Serial.println(F("Starting..."));
-    // bool reply = FTP_upload_function(filelog); // Upload fichier
-    // Serial.println("The end... Response: " + String(reply));
-
-    // if(reply == true){
-    //   message += F("upload OK");
-    //   SPIFFS.remove(filelog);          // efface fichier log
-    //   MajLog(Origine, "");             // nouveau log
-    //   MajLog(Origine, F("upload OK")); // renseigne nouveau log
-    // } else {
-    //   message += F("upload fail");
-    //   MajLog(Origine, F("upload fail"));// renseigne log
-    // }
+    char REMOTE_NAME[50]; // Nom du fichier distant
+    strncpy(REMOTE_NAME, config.Idchar, 10);
+    strcat(REMOTE_NAME, "_log.txt"); 
+    bool ok = HTTP_Upload_File(REMOTE_NAME, filelog);
+    
+    Serial.println(ok ? "Terminé avec succès." : "Échec upload.");
+    message += ok ? "Terminé avec succès." : "Échec upload.";
+    if(ok){
+      SPIFFS.remove(filelog); // efface le log, le fichier log sera automatiquement recréé au prochain log
+    }
     sendReply(Origine);
   }
   else if (gsm && Rmessage.indexOf(F("COEFF")) == 0) {//Lecture/ecriture des coeff
@@ -1540,21 +1698,13 @@ fin_tel:
     sendReply(Origine);
   }
   else if (gsm && Rmessage.indexOf(F("UPLOADCOEFF")) == 0) {//upload des coeff
-    message += "Fonction non active";
-    // message += F("lancement upload Coeff");
-    // message += fl;
-    // MajLog(Origine, "upload coeff");// renseigne log
-    // Serial.println(F("Starting..."));
-    // bool reply = FTP_upload_function(filecalibration); // Upload fichier
-    // Serial.println("The end... Response: " + String(reply));
-
-    // if(reply == true){
-    //   message += F("upload OK");
-    //   MajLog(Origine, F("upload Coeff OK"));// renseigne nouveau log
-    // } else {
-    //   message += F("upload fail");
-    //   MajLog(Origine, F("upload Coeff fail"));// renseigne log
-    // }
+    char REMOTE_NAME[50]; // Nom du fichier distant
+    strncpy(REMOTE_NAME, config.Idchar, 10);
+    strcat(REMOTE_NAME, "_calibration.txt");
+    bool ok = HTTP_Upload_File(REMOTE_NAME, filecalibration);
+    
+    Serial.println(ok ? "Terminé avec succès." : "Échec upload.");
+    message += ok ? "Terminé avec succès." : "Échec upload.";
     sendReply(Origine);
   }
   else if (Rmessage.indexOf("FTPDATA") > -1) {
@@ -1988,6 +2138,97 @@ fin_tel:
     message += String(config.TempoBPexterne);
     sendReply(Origine);
   }
+  else if(Rmessage.startsWith("BLACKLIST?")){
+    // Blacklist actuelle
+    Sbidon = "";
+    String liste = Bllist(Sbidon);
+    message += "Blacklist PLMN: ";
+    message += liste;
+    sendReply(Origine);
+  } else if(Rmessage.startsWith("BLACKLIST=")){
+    // BL= 20801,20810
+    // exemple de commande pour remplacer la blaclist
+    // séparateur ','
+    Efface_BL(); // vide la Blacklist actuelle
+    String rest = Rmessage.substring(10); rest.trim();
+    int start = 0;
+    bool err = false;
+    while (start < rest.length() && BL_COUNT < BL_MAX) {
+      int comma = rest.indexOf(',', start);
+      String tok = (comma<0) ? rest.substring(start) : rest.substring(start, comma);
+      tok.trim();
+      if (tok.length()==5){
+        if(blAdd(tok)) {
+          Serial.print("[BL] added: "); Serial.println(tok);
+        } else {
+          Serial.print("[BL] failed to add (full?): "); Serial.println(tok);
+          err = true;
+        }
+      } else {
+        Serial.print("[BL] invalid PLMN format: "); Serial.println(tok);
+        err = true;
+      }
+      if (comma<0) break; else start = comma+1;
+    }
+    if(err){
+      message += F("erreur adding some PLMN to blacklist.");
+      message += fl;
+      message += "retour liste par défaut";
+      message += fl;
+      blInitDefaults(); // réinitialise la whitelist par défaut
+    }
+    // retourne la whitelist actuelle
+    Sbidon = "";
+    String liste = Bllist(Sbidon);
+    Save_BL();
+    message += "New Blacklist PLMN: ";
+    message += liste;
+    sendReply(Origine);
+  } else if(Rmessage.startsWith("BLACKLIST+")){
+    // BL+ 20815,20889
+    bool err = false;
+    String rest = Rmessage.substring(10); rest.trim();
+    int start = 0;
+    while (start < rest.length()) {
+      int comma = rest.indexOf(',', start);
+      String tok = (comma<0) ? rest.substring(start) : rest.substring(start, comma);
+      tok.trim();
+      if (tok.length()== 5) {
+        if (blAdd(tok)){
+          Serial.print("[BL] added ");
+        } else {
+          Serial.print("[BL] skip ");
+          err = true;
+        }
+        Serial.println(normPlmn(tok));
+      } else {
+        Serial.print("[BL] invalid PLMN format: "); Serial.println(tok);
+        err = true;
+      }
+      if (comma<0) break; else start = comma+1;
+    }
+    if(err){
+      message += F("erreur adding some PLMN to blacklist.");
+      message += fl;
+    }
+    // retourne la whitelist actuelle
+    Sbidon = "";
+    String liste = Bllist(Sbidon);
+    Save_BL();
+    message += "New Blacklist PLMN: ";
+    message += liste;
+    sendReply(Origine);
+  } else if(Rmessage.startsWith("RESETMODEM")){
+    message += "Reset du modem (15s)";
+    sendReply(Origine);
+    SoftResetModem();
+  }
+  else if (Rmessage.indexOf("CONFIG") == 0){
+    PrintConfig();
+  }
+  else if (Rmessage.indexOf("PRINTLOG") == 0){
+    PrintFile(filelog);
+  }
   else {
     message += "Commande non reconnu !";		//"Commande non reconnue ?"
     sendReply(Origine);
@@ -2017,8 +2258,19 @@ void envoie_alarme() {
 //---------------------------------------------------------------------------
 void envoieGroupeMessage(bool vie, bool Serveur) {
   generationMessage();
-  if (vie) { 						// si envoie Etat demandé
-  }
+  // if (vie) { 						// si envoie Etat demandé
+  //   if(cptonBlacklist > 0){
+  //     message += F("Migration réseau : ");
+  //     message += String(cptonBlacklist);
+  //     message += fl;
+  //   }
+  //   if(NbrResetModem > 0){
+  //     message += F("Reset modem : ");
+  //     message += String(NbrResetModem);
+  //     message += fl;
+  //   }
+  //   message_Monitoring_Reseau();
+  // }
   if(config.sendSMS){
   // A Finir 
   }
@@ -2197,7 +2449,6 @@ void SignalVie() {
   Serial.println("Signal vie");
   if (gsm) {
     modem.deleteSmsMessage(0,4);// au cas ou, efface tous les SMS envoyé/reçu
-    NbrResetModem = 0; // reset compteur reset modem
   }
   AIntru_HeureActuelle();
   if ((calendrier[month()][day()] ^ FlagCircule) && jour) { // jour circulé
@@ -2208,6 +2459,11 @@ void SignalVie() {
   }
   envoieGroupeMessage(true,true);  // pasVie,Serveur
   envoieGroupeMessage(true,false); // pasVie,User
+  NbrResetModem     = 0; // reset compteur reset modem
+  cptonBlacklist    = 0; //  reset compteur migration PLMN
+  for(int i = 0; i < 5; i++){ // efface historique réseau
+    Histo_Reseau[i] = 0;
+  }
   action_wakeup_reason(4);
 }
 //---------------------------------------------------------------------------
@@ -2254,6 +2510,26 @@ void listDir(fs::FS &fs, const char * dirname, uint8_t levels) {
     file = root.openNextFile();
   }
   file.close();
+}
+//---------------------------------------------------------------------------
+// Print file
+void PrintFile(const char * path){
+  Serial.printf("Reading file: %s\r\n", path);
+
+  File file = SPIFFS.open(path,"r");
+  if(!file || file.isDirectory()){
+    Serial.print("- failed to open file for reading :");
+    Serial.println(path);
+    return;
+  }
+
+  Serial.println("- read from file:");
+  while (file.available()) {
+    String contenu = file.readStringUntil('\n');
+    Serial.println(contenu);
+  }
+  file.close();
+  
 }
 //---------------------------------------------------------------------------
 void readFile(fs::FS &fs, const char * path) {
@@ -2353,20 +2629,24 @@ void MajLog(String Id, String Raison) {
       messageId();
       message += F("KO Fichier log plein\n");
       message += String(f.size());
-      if(config.autoupload){
+      
         message += F("\nFichier upload vers serveur ");
-        if(FTP_upload_function(filelog)){
-          message += ("OK");
+        char REMOTE_NAME[50]; // Nom du fichier distant
+        strncpy(REMOTE_NAME, config.Idchar, 10);
+        strcat(REMOTE_NAME, "_log.txt"); 
+        bool ok = HTTP_Upload_File(REMOTE_NAME, filelog);
+        if (ok) {
+          message += F("OK");
         } else {
-          message += ("KO");
+          message += F("KO erreur de chargement");
         }
-      } else {
-        message += F("\nFichier efface");
-      }
+        message += F("\nFichier effacé");
+      
       if (gsm) {
         sendReply("MQTTU"); // message U
         sendReply("MQTTS"); // message S
       }
+      
       f.close();
       SPIFFS.remove(filelog);
       FileLogOnce = false;
@@ -3746,22 +4026,29 @@ bool ConnectGPRS(){
 //---------------------------------------------------------------------------
 // Connexion MQTT, Clean session false
 bool mqttConnect() {
-  // if (modem.isGprsConnected()) {
-    // Connect to the MQTT broker.
-    Serial.print("Attempting MQTT connection...");
-    if ( mqttClient.connect(config.Idchar, config.mqttUserName, config.mqttPass,willTopic,1,true,config.Idchar,false)) {
-      Serial.println( "Connected with Client ID:  " + String(config.Idchar) + " User " + String(config.mqttUserName) + " Pwd " + String(config.mqttPass));
-      AlarmeMQTT = false;
-      return true;
-    } else {
-      Serial.print( "failed, rc = " );
-      // See https://pubsubclient.knolleary.net/api.html#state for the failure code explanation.
-      Serial.print( mqttClient.state() );
-      Serial.println( " Will try again in 5 seconds" );
-      AlarmeMQTT = true;
-      return false;
-    }
-  // }
+  // read IMEI for client ID (use full IMEI string)
+  String imei = modem.getIMEI();
+  if (imei.length() < 10) {
+    Serial.println("Failed to get IMEI");
+    randomSeed(micros());
+    imei = randomString(15); // use random ID
+    Serial.println("Using random Client ID: " + imei);
+  }
+  // Connect to the MQTT broker.
+  purgeUART(300);
+  Serial.print("Attempting MQTT connection...");
+  if ( mqttClient.connect(imei.c_str(), config.mqttUserName, config.mqttPass,willTopic,1,true,config.Idchar,false)) {
+    Serial.println( "Connected with Client ID:  " + imei + " User " + String(config.mqttUserName) + " Pwd " + String(config.mqttPass));
+    AlarmeMQTT = false;
+    return true;
+  } else {
+    Serial.print( "failed, rc = " );
+    // See https://pubsubclient.knolleary.net/api.html#state for the failure code explanation.
+    Serial.print( mqttClient.state() );
+    Serial.println( " Will try again in 5 seconds" );
+    AlarmeMQTT = true;
+    return false;
+  }
 }
 //---------------------------------------------------------------------------
 // Subscription MQTT, qos=1
@@ -3832,23 +4119,43 @@ bool SyncHeureModem(int Savetime, bool FirstTime){
 }
 //---------------------------------------------------------------------------
 void message_Monitoring_Reseau(){
+  if(cptonBlacklist > 0){
+    message += F("Migration réseau : ");
+    message += String(cptonBlacklist);
+    message += fl;
+  }
+  if(NbrResetModem > 0){
+    message += F("Reset modem : ");
+    message += String(NbrResetModem);
+    message += fl;
+  }
   message += F("Histo Network Chgt : ");
   message += fl;
-  message += F("no service : ");
-  message += String(Histo_Reseau[0]);
-  message += fl;
-  message += F("GSM : ");
-  message += String(Histo_Reseau[1]);
-  message += fl;
-  message += F("EGPRS : ");
-  message += String(Histo_Reseau[2]);
-  message += fl;
-  message += F("LTE-M1 : ");
-  message += String(Histo_Reseau[3]);
-  message += fl;
-  message += F("LTE-NB : ");
-  message += String(Histo_Reseau[4]);
-  message += fl;
+  if(Histo_Reseau[0] > 0){
+    message += F("no service : ");
+    message += String(Histo_Reseau[0]);
+    message += fl;
+  }
+  if(Histo_Reseau[1] > 0){
+    message += F("GSM : ");
+    message += String(Histo_Reseau[1]);
+    message += fl;
+  }
+  if(Histo_Reseau[2] > 0){
+    message += F("EGPRS : ");
+    message += String(Histo_Reseau[2]);
+    message += fl;
+  }
+  if(Histo_Reseau[3] > 0){
+    message += F("LTE-M1 : ");
+    message += String(Histo_Reseau[3]);
+    message += fl;
+  }
+  if(Histo_Reseau[4] > 0){
+    message += F("LTE-NB : ");
+    message += String(Histo_Reseau[4]);
+    message += fl;
+  }
 }
 //---------------------------------------------------------------------------
 void readmodemtime(){
@@ -4045,49 +4352,49 @@ String read_RSSI() {
 }
 //---------------------------------------------------------------------------
 // Allumage modem
-int modem_on() {
-    /*
-    The indicator light of the board can be controlled
-    */
-    pinMode(LED_PIN, OUTPUT);
-    digitalWrite(LED_PIN, LOW);
+// int modem_on() {
+//     /*
+//     The indicator light of the board can be controlled
+//     */
+//     pinMode(LED_PIN, OUTPUT);
+//     digitalWrite(LED_PIN, LOW);
 
-    /*
-    MODEM_PWRKEY IO:18 The power-on signal of the modulator must be given to it,
-    otherwise the modulator will not reply when the command is sent
-    */
-    pinMode(MODEM_PWRKEY, OUTPUT);
-    digitalWrite(MODEM_PWRKEY, LOW);
-    delay(300);
-    digitalWrite(MODEM_PWRKEY, HIGH);
+//     /*
+//     MODEM_PWRKEY IO:18 The power-on signal of the modulator must be given to it,
+//     otherwise the modulator will not reply when the command is sent
+//     */
+//     pinMode(MODEM_PWRKEY, OUTPUT);
+//     digitalWrite(MODEM_PWRKEY, LOW);
+//     delay(300);
+//     digitalWrite(MODEM_PWRKEY, HIGH);
 
-    /*
-    MODEM_FLIGHT IO:25 Modulator flight mode control,
-    need to enable modulator, this pin must be set to high
-    */
-    // pinMode(MODEM_FLIGHT, OUTPUT);
-    // digitalWrite(MODEM_FLIGHT, HIGH);
+//     /*
+//     MODEM_FLIGHT IO:25 Modulator flight mode control,
+//     need to enable modulator, this pin must be set to high
+//     */
+//     // pinMode(MODEM_FLIGHT, OUTPUT);
+//     // digitalWrite(MODEM_FLIGHT, HIGH);
 
-  int i = 10;
-  Serial.println("Testing Modem Response...");
-  Serial.println("****");
-  while (i) {
-    SerialAT.println("AT");
-    delay(500);
-    if (SerialAT.available()) {
-      String r = SerialAT.readString();
-      Serial.println(r);
-      if ( r.indexOf("OK") >= 0 ) {
-        // reply = true;
-        break;
-      }
-    }
-    delay(500);
-    i--;
-  }
-  Serial.println("****");
-  return i;
-}
+//   int i = 10;
+//   Serial.println("Testing Modem Response...");
+//   Serial.println("****");
+//   while (i) {
+//     SerialAT.println("AT");
+//     delay(500);
+//     if (SerialAT.available()) {
+//       String r = SerialAT.readString();
+//       Serial.println(r);
+//       if ( r.indexOf("OK") >= 0 ) {
+//         // reply = true;
+//         break;
+//       }
+//     }
+//     delay(500);
+//     i--;
+//   }
+//   Serial.println("****");
+//   return i;
+// }
 //---------------------------------------------------------------------------
 // retourne n° derniere ligne PhoneBook
 byte last_PB(){
@@ -4138,6 +4445,63 @@ void Save_PB(){
     if(strlen(PB_list[i])>0){
       file.println(String(PB_list[i]));
     }
+  }
+  file.close();
+}
+//---------------------------------------------------------------------------
+// Vérification fichier Blacklist PLMN existe
+void Ouvrir_BL(){
+  if (!SPIFFS.exists(fileBlacklist)) {
+    // fichier n'existe pas
+    Serial.print(F("Creating Data File:")), Serial.println(fileBlacklist); // valeur par defaut
+    blInitDefaults();
+    // sauvegarde BLACKLIST
+    Save_BL();
+  } else {
+    Read_BL();
+  }
+}
+//---------------------------------------------------------------------------
+void blInitDefaults(){
+  // vide Blacklist
+  Efface_BL();
+  // Valeurs par défaut
+  const char* BL_DEFAULTS[] = { "20815", "20889", "20890" };
+  const uint8_t BL_DEFAULTS_N = sizeof(BL_DEFAULTS)/sizeof(BL_DEFAULTS[0]);
+  // copie BL_DEFAULTS dans BLACKLIST
+  for (uint8_t i=0; i<BL_DEFAULTS_N && i<BL_MAX; i++) {
+    strncpy(BLACKLIST[i], BL_DEFAULTS[i], sizeof(BLACKLIST[i])-1);
+    BLACKLIST[i][sizeof(BLACKLIST[i])-1] = '\0';
+    BL_COUNT++;
+  }
+}
+//---------------------------------------------------------------------------
+// Lecture fichier Blacklist copie dans BLACKLIST
+void Read_BL(){
+  Efface_BL();
+  // lire fichier
+  File file = SPIFFS.open(fileBlacklist, "r");
+  while (file.available()) {
+    String ligne = file.readStringUntil('\n');
+    strcpy(BLACKLIST[BL_COUNT] , ligne.c_str());
+    BL_COUNT ++;
+  }
+  file.close();
+}
+//---------------------------------------------------------------------------
+// Vide Blacklist
+void Efface_BL(){
+  for(byte i = 1;i<BL_MAX;i++){
+    strcpy(BLACKLIST[i] , "");
+  }
+  BL_COUNT = 0;
+}
+//---------------------------------------------------------------------------
+// sauvegarde BLACKLIST
+void Save_BL(){
+  File file = SPIFFS.open(fileBlacklist, "w+");
+  for(int i = 0;i < BL_COUNT; i ++){
+    file.println(String(BLACKLIST[i]));
   }
   file.close();
 }
@@ -4291,7 +4655,11 @@ void Cde_change_etat_CVR(){
     // une demande de changement d'etat CVR est en cours
     return;
   }
-  Serial.printf("Cde externe changement etat CVR de %d vers %d\n", Cvr, Cvr);
+  Cvr = Position_CVR();
+  Serial.print("Cde externe changement etat CVR de ");
+  if(Cvr == 1){ Serial.println("fermé à ouvert"); }
+  else if(Cvr == 2){ Serial.println("ouvert à fermé"); }
+
   if(Cvr == 1){ // fermé -> ouvrir
     // demande Ouverture
     Memo_Demande_CVR[0] = "Local"; // nom demandeur
@@ -4309,6 +4677,463 @@ void Cde_change_etat_CVR(){
     MajLog("Local", "demande : BP Local");
     Fermer_CVR();
   }
+}
+//---------------------------------------------------------------------------
+String base64Encode(const uint8_t* data, size_t len) {
+  String out;
+  out.reserve(((len + 2) / 3) * 4);
+  for (size_t i = 0; i < len; i += 3) {
+    uint32_t n = (uint32_t)data[i] << 16;
+    if (i + 1 < len) n |= (uint32_t)data[i + 1] << 8;
+    if (i + 2 < len) n |= (uint32_t)data[i + 2];
+
+    char c0 = b64tab[(n >> 18) & 63];
+    char c1 = b64tab[(n >> 12) & 63];
+    char c2 = (i + 1 < len) ? b64tab[(n >> 6) & 63] : '=';
+    char c3 = (i + 2 < len) ? b64tab[n & 63]         : '=';
+
+    out += c0; out += c1; out += c2; out += c3;
+  }
+  return out;
+}
+//---------------------------------------------------------------------------
+String makeBasicAuthHeader(const char* user, const char* pass) {
+  String up = String(user) + ":" + String(pass);
+  String b64 = base64Encode((const uint8_t*)up.c_str(), up.length());
+  String hdr = "Authorization: Basic " + b64 + "\r\n";
+  return hdr;
+}
+//---------------------------------------------------------------------------
+// Upload multipart/form-data via HTTP (port 80) avec Basic Auth
+bool httpUploadMultipart(Client& sock,
+                         const char* host, uint16_t port, const char* path,
+                         const char* fieldName, const char* filename,
+                         const char* contentType, const char* localPath,
+                         const String& authHeader)          // <--- NEW
+{
+  if (!SPIFFS.exists(localPath)) { Serial.println("[HTTP] file missing"); return false; }
+  File f = SPIFFS.open(localPath, "r");
+  if (!f) { Serial.println("[HTTP] open fail"); return false; }
+
+  const char* boundary = "----PicoBoundary7d8a9b0c";
+
+  String head = String("--") + boundary + "\r\n"
+                "Content-Disposition: form-data; name=\"" + String(fieldName) +
+                "\"; filename=\"" + filename + "\"\r\n"
+                "Content-Type: " + contentType + "\r\n\r\n";
+
+  String tail = String("\r\n--") + boundary + "--\r\n";
+
+  size_t contentLength = head.length() + f.size() + tail.length();
+
+  Serial.print("[HTTP] Connexion "); Serial.print(host); Serial.print(':'); Serial.println(port);
+  if (!sock.connect(host, port)) { Serial.println("[HTTP] connect fail"); f.close(); return false; }
+
+  // Requête
+  sock.print(String("POST ") + path + " HTTP/1.1\r\n");
+  sock.print(String("Host: ") + host + "\r\n");
+  sock.print("Connection: close\r\n");
+  if (authHeader.length()) sock.print(authHeader);      // <--- envoie Basic Auth
+  sock.print(String("Content-Type: multipart/form-data; boundary=") + boundary + "\r\n");
+  sock.print(String("Content-Length: ") + contentLength + "\r\n\r\n");
+
+  // Corps
+  sock.print(head);
+  uint8_t buf[1460]; size_t n;
+  while ((n = f.read(buf, sizeof(buf))) > 0) {
+    if (sock.write(buf, n) < 0) { Serial.println("[HTTP] write fail"); f.close(); sock.stop(); return false; }
+    delay(1);
+  }
+  f.close();
+  sock.print(tail);
+
+  // Statut
+  String status = sock.readStringUntil('\n'); status.trim();
+  Serial.print("[HTTP] Status: "); Serial.println(status);
+
+  // Draine le corps (debug)
+  uint32_t t0 = millis();
+  while (millis() - t0 < 15000) {
+    while (sock.available()) { Serial.write(sock.read()); t0 = millis(); }
+    if (!sock.connected()) break;
+    delay(10);
+  }
+  sock.stop();
+
+  bool ok = status.indexOf(" 200 ") > 0;
+  Serial.println(ok ? "[HTTP] Upload OK" : "[HTTP] Upload FAIL");
+  return ok;
+}
+//---------------------------------------------------------------------------
+// HTTP Upload file
+bool HTTP_Upload_File(const char* REMOTE_NAME, const char* filelog) {
+  // Construire l'en-tête Basic Auth automatiquement (user:pass -> base64)
+  String authHeader = makeBasicAuthHeader(BASIC_USER, BASIC_PASS);
+  bool ok = httpUploadMultipart(httpSock, config.mqttServer, HTTP_PORT, HTTP_PATH,
+                                "file", REMOTE_NAME, MIME_TYPE,
+                                filelog, authHeader);
+  return ok;
+}
+//---------------------------------------------------------------------------
+// Contenu dans la Blacklist
+bool blContains(const String& plmnRaw) {
+  String k = normPlmn(plmnRaw);
+  // Cas spéciaux par nom (optionnel)
+  if (k == "free" || k.indexOf("free")>=0) return true;
+
+  for (uint8_t i=0; i<BL_COUNT; i++) {
+    if (k.equalsIgnoreCase(BLACKLIST[i])) return true;
+  }
+  return false;
+}
+//---------------------------------------------------------------------------
+// Ajout dans Blacklist
+bool blAdd(const String& plmnRaw) {
+  String k = normPlmn(plmnRaw);
+  if (k.length()==0) return false;
+  if (blContains(k)) return false;
+  if (BL_COUNT >= BL_MAX) return false;
+  strncpy(BLACKLIST[BL_COUNT], k.c_str(), sizeof(BLACKLIST[BL_COUNT])-1);
+  BLACKLIST[BL_COUNT][sizeof(BLACKLIST[BL_COUNT])-1] = '\0';
+  BL_COUNT++;
+  return true;
+}
+//---------------------------------------------------------------------------
+// Suppression dans Blacklist
+bool blRemove(const String& plmnRaw) {
+  String k = normPlmn(plmnRaw);
+  for (uint8_t i=0; i<BL_COUNT; i++) {
+    if (k.equalsIgnoreCase(BLACKLIST[i])) {
+      // compactage
+      for (uint8_t j=i+1; j<BL_COUNT; j++) {
+        strncpy(BLACKLIST[j-1], BLACKLIST[j], sizeof(BLACKLIST[j-1])-1);
+        BLACKLIST[j-1][sizeof(BLACKLIST[j-1])-1] = '\0';
+      }
+      BL_COUNT--;
+      return true;
+    }
+  }
+  return false;
+}
+//---------------------------------------------------------------------------
+// Liste la Blacklist
+String Bllist(String ligne) {
+  for (uint8_t i=0; i<BL_COUNT; i++) {
+    ligne += BLACKLIST[i];
+    if(i < BL_COUNT -1) ligne += ", ";
+  }
+  return ligne;
+}
+//---------------------------------------------------------------------------
+// Cherche si PLMN est sur Blacklist
+bool isBlacklisted(const String& plmnOrName) {
+  return blContains(plmnOrName);
+}
+//---------------------------------------------------------------------------
+// Normalise un PLMN: garde seulement 5-6 chiffres consécutifs si trouvés.
+String normPlmn(const String& s) {
+  String t = s; t.trim();
+  // Cherche un bloc de chiffres de 5 à 6
+  int n = t.length();
+  for (int i=0;i<n;i++) {
+    if (isDigit((unsigned char)t[i])) {
+      int j=i; while (j<n && isDigit((unsigned char)t[j])) j++;
+      int len = j - i;
+      if (len==5 || len==6) return t.substring(i, j);
+      i = j;
+    }
+  }
+  // si rien: retourne tel quel en minuscule (permet "free")
+  t.toLowerCase();
+  return t;
+}
+//---------------------------------------------------------------------------
+// Reattach réseau total 15s
+void ReattachModem() {
+  purgeUART(300);
+  modem.sendAT("+COPS=2"); modem.waitResponse(300);
+  delay(5000);
+  modem.sendAT("+COPS=0");
+  delay(10000);
+  while (SerialAT.available()) SerialAT.read();
+}
+//---------------------------------------------------------------------------
+// Vérification Réseau CEREG et Ip
+bool Check_Network(){
+  bool net   = false;
+  bool pdpip = false;
+  net = modem.isNetworkConnected();
+  String ip="";
+  if(readPdpIp(ip)) pdpip = true;
+  return (pdpip && net) ;
+}
+//---------------------------------------------------------------------------
+// PDP up rapide compatible TinyGSM (SIM7000 en mode CGACT)
+bool isPdpUp(uint8_t cid = 1) {
+  String r;
+  // 1) CNACT?
+  modem.sendAT("+CNACT?");
+  if (modem.waitResponse(300, r) == 1) {
+    int p = r.indexOf("+CNACT:");
+    if (p >= 0) {
+      int q1 = r.indexOf('"', p), q2 = (q1>=0) ? r.indexOf('"', q1+1) : -1;
+      if (q1 >= 0 && q2 > q1) {
+        String ip = r.substring(q1+1, q2); ip.trim();
+        if (ip.length() > 6 && ip != "0.0.0.0") return true;
+      }
+    }
+  }
+  // 2) CGPADDR=cid
+  r = ""; modem.sendAT(String("+CGPADDR=") + cid);
+  if (modem.waitResponse(300, r) == 1) {
+    int q1 = r.indexOf('"'); if (q1 >= 0) { int q2 = r.indexOf('"', q1+1);
+      if (q2 > q1) { String ip = r.substring(q1+1, q2); ip.trim();
+        if (ip.length() > 6 && ip != "0.0.0.0") return true;
+      }
+    }
+  }
+  // 3) CGACT? (NE SUFFIT PAS pour dire "up" — juste indice)
+  return false;
+}
+//---------------------------------------------------------------------------
+// --- sécurisation RAT: LTE-only + Cat-M ---
+bool setLTE_M_only() {
+  modem.sendAT("ATE0"); modem.waitResponse(300);
+  modem.sendAT("+CMEE=2"); modem.waitResponse(300);
+  modem.sendAT("+CPSMS=0","OK","ERROR", 1000);  // Power Saving Mode off
+  modem.sendAT("+CEDRXS=0","OK","ERROR", 1000); // éviter latences PSM/eDRX
+  
+  for (int i=0;i<5;i++){
+    modem.sendAT("+CNMP=38"); modem.waitResponse(1200);
+    String r; modem.sendAT("+CNMP?"); if (modem.waitResponse(800, r)==1 && r.indexOf("CNMP: 38")>=0) break;
+    if (i==4) { Serial.println("[WARN] CNMP not locked to 38"); return false; }
+    delay(200);
+  }
+  // CMNB=1 (Cat-M only) avec vérif
+  for (int i=0;i<5;i++){
+    modem.sendAT("+CMNB=1"); modem.waitResponse(800);
+    String r; modem.sendAT("+CMNB?"); if (modem.waitResponse(800, r)==1 && r.indexOf("CMNB: 1")>=0) return true;
+    if (i==4) { Serial.println("[WARN] CMNB not locked to 1"); return false; }
+    delay(200);
+  }
+  return true;
+}
+//---------------------------------------------------------------------------
+// COPS format numérique
+static void ensureCopsNumeric() {
+  modem.sendAT("+COPS=3,2");         // 3 = format, 2 = numérique
+  modem.waitResponse(500);
+}
+//---------------------------------------------------------------------------
+// Attente attach EPS OU IP, bornée (rapide, sans spam)
+bool waitAttach(uint32_t timeoutMs = 35000) {
+  purgeUART(300);
+  uint8_t cid = 1;
+  uint32_t t0 = millis(); String r;
+  while (millis() - t0 < timeoutMs) {
+    modem.sendAT("+CGPADDR=", cid);
+    if (modem.waitResponse(600, r) == 1 && r.indexOf("+CGPADDR") >= 0 && r.indexOf("0.0.0.0") < 0) return true;
+    modem.sendAT("+CEREG?");
+    if (modem.waitResponse(600, r) == 1 && (r.indexOf(",1") >= 0 || r.indexOf(",5") >= 0)) return true;
+    // CSQ nul ? ne pas s’acharner (tempo légère)
+    modem.sendAT("+CSQ"); modem.waitResponse(400);
+    delay(900);
+  }
+  return false;
+}
+//---------------------------------------------------------------------------
+static bool ipLooksValid(const String& ip) {
+  // rejette vide, 0.0.0.0, ou lignes parasites
+  if (ip.length() < 7) return false;
+  if (ip.indexOf("0.0.0.0") >= 0) return false;
+  // check minimal "n.n.n.n"
+  int dots = 0;
+  for (char c : ip) if (c == '.') dots++;
+  return dots == 3;
+}
+//---------------------------------------------------------------------------
+// Lit l'IP du contexte PDP CID=1 via +CGPADDR=1.
+// Si vide/non valide, tente un fallback via CIFSR (pile IP interne).
+bool readPdpIp(String& outIp) {
+  outIp = "";
+  // Interroge d'abord le standard 3GPP
+  modem.sendAT("+CGPADDR=1");
+  if (modem.waitResponse(1000, "+CGPADDR:") == 1) {
+    String line = modem.stream.readStringUntil('\n');
+    line.trim(); // ex: " 1,10.97.155.121"
+    // isole après la virgule
+    int comma = line.indexOf(',');
+    if (comma >= 0 && comma + 1 < (int)line.length()) {
+      String ip = line.substring(comma + 1);
+      ip.trim();
+      if (ipLooksValid(ip)) { outIp = ip; modem.waitResponse(200); return true; }
+    }
+  }
+  modem.waitResponse(200); // flush OK/CRLF éventuels
+
+  // Fallback: CIFSR (si la pile interne a une IP)
+  modem.sendAT("+CIFSR");
+  if (modem.waitResponse(1500) == 1) {
+    String ip = modem.stream.readStringUntil('\n');
+    ip.trim();
+    if (ipLooksValid(ip)) { outIp = ip; modem.waitResponse(200); return true; }
+  }
+  modem.waitResponse(200);
+  return false;
+}
+
+//---------------------------------------------------------------------------
+// Cold start rapide: profil radio/bandes/APN + un cycle auto-attach ; sinon ResetModem
+bool coldAttach(uint8_t tries = 2) {
+  ensureCopsNumeric();
+  for (uint8_t k=0; k<tries; k++) {
+    ReattachModem();                         // COPS=2 -> délai -> COPS=0
+    if (waitAttach(60000)) return true;
+  }
+  // Dernier recours: n’utiliser PWRKEY que si VRAIMENT OFF
+  if (!sawUrcActivityDuring(2000) && !ensureModemReady(2000)) {
+    Serial.println("[RECOVER] No URC & no AT -> PWRKEY last resort");
+    PwrKey();
+    SoftResetModem();
+    ensureCopsNumeric();
+    return waitAttach(40000);
+  }
+  return false;
+}
+//---------------------------------------------------------------------------
+void PwrKey() {
+//     MODEM_PWRKEY IO:18 The power-on signal of the modulator must be given to it,
+//     otherwise the modulator will not reply when the command is sent
+//     */
+    pinMode(MODEM_PWRKEY, OUTPUT);
+    digitalWrite(MODEM_PWRKEY, LOW);
+    delay(300);
+    digitalWrite(MODEM_PWRKEY, HIGH);
+}
+//---------------------------------------------------------------------------
+bool SoftResetModem() {
+  Serial.println("[MODEM] Soft ResetModem");
+  modem.sendAT("+CFUN=1,1"); 
+  modem.waitResponse(3000);
+  delay(5000);  // attendre reboot
+  return ensureModemReady(8000);
+}
+//---------------------------------------------------------------------------
+// Warm resume robuste (réutilise un modem déjà up sans tout refaire)
+static bool tryWarmResume() {
+  String r;
+  modem.sendAT("+CPIN?"); if (modem.waitResponse(800, r) != 1 || r.indexOf("READY") < 0) return false;
+  modem.sendAT("+CEREG?"); if (modem.waitResponse(800, r) != 1 || (r.indexOf(",1") < 0 && r.indexOf(",5") < 0)) return false;
+  modem.sendAT("+CGPADDR=1"); modem.waitResponse(800, r);
+  if (r.indexOf("+CGPADDR") < 0 || r.indexOf("0.0.0.0") >= 0) {
+    modem.sendAT("+CGATT=0"); modem.waitResponse(1000); delay(800);
+    modem.sendAT("+CGATT=1"); modem.waitResponse(3000); delay(800);
+    modem.sendAT("+CGACT=1,1"); modem.waitResponse(2000); delay(800);
+  }
+  modem.sendAT("+COPS?"); modem.waitResponse(800, r);
+  // check Operateur comprend bien 208 ou nom Opérateur
+  if (r.indexOf("208") < 0 && r.indexOf("Orange") < 0 && r.indexOf("SFR") < 0 && r.indexOf("Bouygues") < 0) return false;
+  return true;
+}//---------------------------------------------------------------------------
+// Lecture du PLMN courant
+String getPLMN() {
+  
+  for (int k=0; k<3; k++) {                 // 3 tentatives espacées
+    modem.sendAT("+COPS?");
+    String r;
+    if (modem.waitResponse(1200, r) == 1) {
+      int p = r.indexOf(",2,\"");
+      if (p >= 0) {
+        int q = r.indexOf('"', p+4);
+        if (q > p) return r.substring(p+4, q);
+      }
+      // fallback name
+      int n = r.indexOf('"'); if (n >= 0) { int m = r.indexOf('"', n+1); if (m>n) return r.substring(n+1, m); }
+    }
+    delay(300);                              // laisse le réseau remplir les infos
+  }
+  return "";
+}
+//---------------------------------------------------------------------------
+// info radio de base
+void printRadioInfo() {
+  String r;
+  modem.sendAT("+CSQ"); modem.waitResponse(500, r); Serial.print("[RAD] "); Serial.println(r);
+  r = "";
+  modem.sendAT("+CPSI?"); modem.waitResponse(1000, r); Serial.print("[RAD] "); Serial.println(r);
+}
+//---------------------------------------------------------------------------
+// Purge des URC sur une fenêtre donnée
+void purgeUART(uint32_t timeoutMs = 800) {
+  // Purge des URC type "SMS Ready"
+  uint32_t t0 = millis();
+  while (millis() - t0 < timeoutMs) {    // ~0.8 s suffit
+    while (SerialAT.available()) SerialAT.read();
+    delay(20);
+  }
+}
+//---------------------------------------------------------------------------
+// Essaie d'obtenir une réponse AT dans la fenêtre donnée
+bool ensureModemReady(uint32_t budget_ms = 12000) {
+  uint32_t t0 = millis(); String r;
+  while (millis() - t0 < budget_ms) {
+    SerialAT.println("AT");
+    delay(500);
+    if (SerialAT.available()) {
+      String r = SerialAT.readString();
+      Serial.println(r);
+      if ( r.indexOf("OK") >= 0 ) {
+        return true;
+        break;
+      }
+    }
+    delay(500);
+  }
+  return false;
+}
+//---------------------------------------------------------------------------
+// Re-verrouille CNMP/CMNB si le module a reset et a perdu le profil
+void relockRadioIfNeeded() {
+  String r;
+  modem.sendAT("+CNMP?"); if (modem.waitResponse(800, r) == 1 && r.indexOf("CNMP: 38") < 0) {
+    Serial.println("[RADIO] Relock CNMP=38/CMNB=1");
+    setLTE_M_only();
+  }
+  modem.sendAT("+CMNB?"); if (modem.waitResponse(800, r) == 1 && r.indexOf("CMNB: 1") < 0) {
+    setLTE_M_only();
+  }
+}
+//---------------------------------------------------------------------------
+// Vrai si on voit du trafic (URC) pendant la fenêtre donnée.
+// Prolonge légèrement la fenêtre tant qu’il y a des octets.
+bool sawUrcActivityDuring(uint32_t ms = 6000) {
+  uint32_t t0 = millis();
+  bool any = false;
+  while (millis() - t0 < ms) {
+    if (SerialAT.available()) {
+      any = true;
+      while (SerialAT.available()) SerialAT.read();
+      t0 = millis(); // prolonge un peu dès qu’il y a du flux
+    }
+    delay(5);
+  }
+  return any;
+}
+//---------------------------------------------------------------------------
+String randomString(size_t length) {
+  const char charset[] =
+    "abcdefghijklmnopqrstuvwxyz"
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    "0123456789";
+
+  String result;
+  result.reserve(length);
+
+  for (size_t i = 0; i < length; i++) {
+    int index = random(0, sizeof(charset) - 1);
+    result += charset[index];
+  }
+  return result;
 }
 /* --------------------  test local serial seulement ----------------------*/
 void recvOneChar() {
